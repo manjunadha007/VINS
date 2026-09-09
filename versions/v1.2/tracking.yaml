@@ -1,0 +1,127 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Virtual Production Camera Tracking — operator configuration
+#
+#  Every key is optional: anything you leave out falls back to the defaults in
+#  tracking_config.py. Edit this file, restart the dashboard, done — no code
+#  changes needed on set.
+# ═══════════════════════════════════════════════════════════════════════════
+
+network:
+  # ── SET THIS to the machine running Unreal Engine. ──
+  # 127.0.0.1 only works when Unreal is on this same computer. For a normal
+  # setup (tracking box + separate Unreal workstation) put the Unreal machine's
+  # LAN address here, e.g. 192.168.1.50, and make sure UDP 11111 is open.
+  unreal_ip: "127.0.0.1"
+  unreal_port: 11111
+
+  # Must match the Camera ID of the LiveLinkFreeD subject inside Unreal.
+  camera_id: 1
+
+  # 0    = send a packet for every SLAM pose (lowest latency)
+  # 60   = fixed 60 Hz, predicted between SLAM updates (recommended)
+  # 30   = match a 30 fps shoot
+  send_rate_hz: 60
+
+transform:
+  # 1.0 sends metres, which is what the FreeD spec specifies and what Unreal's
+  # LiveLinkFreeD plugin expects. Only change this if Unreal shows movement
+  # scaled by a constant factor (e.g. 100 if it wants centimetres).
+  position_scale: 1.0
+
+  # Defaults below are the derived ROS -> Unreal mapping and should be correct.
+  # If an axis moves the WRONG WAY in Unreal, flip that one sign.
+  # Run:  python3 calibrate_axes.py
+  # to move one axis at a time and see which is which.
+  position_sign: [1.0, -1.0, 1.0]   # X, Y, Z
+  pan_sign: -1.0
+  tilt_sign: -1.0
+  roll_sign: 1.0
+
+  # Constant trim, applied after conversion. Use pan_offset_deg to align the
+  # virtual camera's rest heading with your set.
+  pan_offset_deg: 0.0
+  tilt_offset_deg: 0.0
+  roll_offset_deg: 0.0
+
+  # Where the film camera's optical centre (nodal point) sits relative to the
+  # RealSense, in ROS body axes: X forward, Y left, Z up.
+  # Example: RealSense mounted 12 cm below and 5 cm behind the taking lens
+  #   translation_m: [-0.05, 0.0, 0.12]
+  rig_offset:
+    translation_m: [0.0, 0.0, 0.0]
+    rotation_deg: [0.0, 0.0, 0.0]
+
+tracking:
+  # Capture-to-render latency compensation. Start at 0. Measure your real
+  # end-to-end delay first (see README "Latency"), then dial in. Too much
+  # prediction overshoots on fast pans.
+  lead_time_s: 0.0
+
+  # Hard cap on extrapolation. If SLAM stalls, the virtual camera freezes here
+  # instead of drifting off into the void.
+  max_extrapolation_s: 0.05
+
+  # After this long with no pose, the dashboard flags INVALID and holds the last
+  # good pose rather than streaming stale or fabricated data.
+  stale_pose_timeout_s: 0.25
+
+  # 0.0 = off. Raise (0.2-0.5) only if micro-jitter is visible in the composite;
+  # it costs latency.
+  smoothing_alpha: 0.0
+
+  # Outlier gate. cuVSLAM relocalisations and loop closures can snap the pose by
+  # over a metre between two frames. Rather than let that teleport the virtual
+  # camera, the snap is absorbed into a standing offset so the output stays
+  # continuous. Verified on recorded data from this rig: peak excursion on a
+  # diverging take dropped from 138.9 m to 1.08 m, worst step 106.9 m to 146 mm.
+  #
+  # Defaults tuned against real handheld motion on this camera, whose 95th
+  # percentile step at 90 Hz was 16.3 mm. Raise the limits if you legitimately
+  # move faster than 3 m/s and see the gate rejecting real movement (the
+  # dashboard status panel reports the reject count).
+  gate_enabled: true
+  gate_max_speed_m_s: 3.0
+  gate_max_jump_m: 0.05
+  gate_max_angular_deg_s: 900.0
+  gate_max_consecutive_rejects: 15
+
+  # Stationary hold (ZUPT). With the rig physically still, pure visual odometry
+  # still creeps. The IMU can tell nothing is moving, so the output is pinned and
+  # the creep absorbed into an offset — releasing therefore produces no jump.
+  #
+  # Measured on this rig over 20 s with the camera untouched:
+  #     max excursion   27.89 mm  ->  0.70 mm      (97.5 % reduction)
+  #     integrated path 60.76 mm  ->  0.72 mm
+  # and real movement was 100 % preserved when replayed against recorded motion.
+  #
+  # Entering the hold needs a full quiet window; leaving it takes a single sample
+  # above the release threshold, so the start of a real move is never delayed.
+  # If the hold engages while you are making very slow creeping moves, lower
+  # hold_gyro_still_rad_s. If it never engages, raise it (stationary gyro noise
+  # on this camera peaked at 0.023 rad/s).
+  hold_enabled: true
+  hold_gyro_still_rad_s: 0.05
+  hold_gyro_release_rad_s: 0.08
+  hold_accel_still_std: 0.15
+  hold_window_samples: 60          # 0.3 s at 200 Hz
+
+aruco:
+  enabled: true
+  dictionary: "DICT_4X4_1000"
+  # Physical edge length of the printed marker, in metres. Measure it — getting
+  # this wrong scales your ground-zero offset.
+  marker_size_m: 0.10
+
+gnss:
+  # Studio work: leave this off. It exists for outdoor large-volume shoots.
+  enabled: false
+  port: "/dev/ttyACM0"
+  baud: 115200
+
+timecode:
+  # LTC decoded from the audio input, shown on the dashboard for slating.
+  enabled: true
+
+ui:
+  refresh_hz: 60
+  trajectory_points: 3000

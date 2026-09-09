@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# One-off patch scripts and local experiments
+scratch/
+
+# Local run artefacts
+*.log
+_*.png
+core
+
+# Large capture data — scans live in the Isaac workspace, not in source.
+# Room01_Scaled_UE.obj is kept deliberately as the reference scan; add other
+# .obj/.ply/.pcd captures here rather than committing them.
+*.ply
+*.pcd

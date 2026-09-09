@@ -1,0 +1,28 @@
+# Version snapshots
+
+Plain directory copies, not a VCS. Each is self-contained: the Python modules
+have no relative-import tricks, so a snapshot can be run and tested in place.
+
+| Version | State | Headline |
+|---|---|---|
+| [v1.1](v1.1/VERSION.md) | frozen | First fully hardware-validated pipeline. Correct ROS→Unreal conversion, exposure cap, pure visual odometry, snap-absorbing PoseGate. |
+| [v1.2](v1.2/VERSION.md) | frozen | Stationary drift eliminated: 27.89 mm → 0.70 mm over 20 s (97.5 %), real motion 100 % preserved. |
+| [v1.3](v1.3/VERSION.md) | frozen | Supervised tracking, Camera Lineup Lite, timestamp-paired depth matching. |
+| [v1.4](v1.4/VERSION.md) | frozen | Marker-referenced absolute lineup, locator derived from the scan. Dot tracked a moving camera to 10 mm median over 1.13 m. |
+| — | **in development** — repository root | See `../VERSION.md`. |
+
+## Verifying a snapshot
+
+Each one carries its own tests and can be checked without ROS:
+
+    cd versions/v1.2
+    python3 -m unittest test_pose_transform test_freed_protocol
+
+v1.2 passes 92 tests this way; v1.4 passes 123 offline plus 57 viewport tests.
+
+## Rolling back
+
+    cp versions/v1.2/*.py versions/v1.2/*.sh versions/v1.2/*.yaml .
+
+Then redeploy into the container with `./launch_isaac.sh`, which copies the
+bridge modules into `~/workspaces/isaac_ros-dev/src/` on every launch.
