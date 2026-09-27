@@ -1,3 +1,32 @@
+# 2026-09-27 — v1.5 snapshot: hardware-checked startup, IMU fix in the container
+
+Frozen as `versions/v1.5/`. v1.4's tracking, made to start reliably on a
+freshly recreated Isaac container and to refuse to open the dashboard until the
+camera, IMU and SLAM are actually streaming.
+
+The D455 IMU no longer takes the cameras down. The Isaac image's librealsense
+2.55.1 predates firmware 5.16's 38-byte IMU report; when the IMU stalls the
+whole session aborts and IR and depth drop to 0 Hz. `ensure_realsense_imu.sh`
+rebuilds it inside the container with upstream PR #12857. Validated live: IMU at
+400 Hz alongside stereo, depth and SLAM, with no host-side DKMS.
+
+Startup now fails loudly. `check_pipeline.py` replaces `sleep 15` and waits for
+sustained, advancing stereo, calibration, IMU and odometry. The numpy<2 pin and
+the cuVSLAM install run on every launch instead of silently once at cold start;
+the recreated container on 2026-09-27 was missing cuVSLAM and this installed it.
+`cleanup()` now really stops SLAM: its pkill patterns used to kill their own
+shell first.
+
+The check passed on the D455 both direct to the PC and through a 5 Gbps hub
+(IR 80-90 Hz, depth 80-88 Hz, IMU 400 Hz, odometry 97-100 Hz). The AR overlay
+and lineup score now use the pose at each frame's own timestamp, and marker
+heading seeds moved from 15 to 10 degrees so a rig 0.9 m back still locks.
+
+Known limits: a fresh container's first launch takes a few minutes and needs
+network; the check's rates come from a ~1 s window; the cleanup fix has not yet
+been seen on a real dashboard close; `test_ui.py` can abort on exit while a live
+pipeline is streaming.
+
 # 2026-09-09 — v1.4 snapshot: marker-referenced absolute lineup
 
 Frozen as `versions/v1.4/`. A printed ArUco marker now places the camera inside
