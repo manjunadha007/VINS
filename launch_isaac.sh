@@ -79,8 +79,9 @@ fi
 # *this* script exits, so it cannot help with an earlier run that was killed or
 # backgrounded.
 #
-# Killed by explicit PID rather than pkill, which did not reliably reap the
-# component_container processes here.
+# Killed by explicit PID rather than pkill. The pkill here "did not reliably
+# reap" component_container because its unbracketed pattern matched and killed
+# the bash -c running it first; see cleanup() below.
 echo "0/3 Stopping any previous run..."
 STALE=$(docker exec -u root "$CONTAINER" /bin/bash -c \
     "ps -eo pid,cmd --no-headers | grep -E 'bridge_headless|dashboard_isaac|component_container|realsense2_camera_node' | grep -v grep | awk '{print \$1}'" 2>/dev/null | tr '\n' ' ')
@@ -98,10 +99,15 @@ xhost +local:root >/dev/null 2>&1
 cleanup() {
     echo ""
     echo "Dashboard closed. Stopping SLAM node..."
+    # Bracketed first letters are required, not style: pkill -f matches full
+    # command lines, and this bash -c's own command line contains every
+    # pattern. Unbracketed, the first pkill killed this shell, the other two
+    # never ran, and component_container kept holding the camera and GPU
+    # after "Pipeline shut down" was printed.
     docker exec -u admin "$CONTAINER" /bin/bash -c \
-        "pkill -f 'ros2 launch' || true; \
-         pkill -9 -f 'component_container' || true; \
-         pkill -9 -f 'realsense2_camera' || true"
+        "pkill -f '[r]os2 launch' || true; \
+         pkill -9 -f '[c]omponent_container' || true; \
+         pkill -9 -f '[r]ealsense2_camera' || true"
     echo "✅ Pipeline shut down."
 }
 trap cleanup EXIT INT TERM
