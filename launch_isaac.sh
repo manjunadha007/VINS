@@ -58,10 +58,11 @@ if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     echo "   Container is up! Waiting 10s for initialization..."
     sleep 10
 
-    echo "   Installing required ROS packages & fixing NumPy..."
-    # The container loses apt installs on fresh boot unless committed
-    docker exec -u root "$CONTAINER" /bin/bash -c "apt-get update && apt-get install -y ros-humble-isaac-ros-visual-slam" >/dev/null 2>&1
-    docker exec -u admin "$CONTAINER" /bin/bash -c "python3 -m pip install 'numpy<2'" >/dev/null 2>&1
+    # The ROS package install and the numpy<2 pin used to live here, ten
+    # seconds after the container starts and silenced with >/dev/null 2>&1.
+    # Both are now guards further down: they run on every launch, they run
+    # late enough that the container's network is actually up, and they say
+    # what they are doing instead of failing invisibly.
     
     echo "✅ Cold start complete!"
 fi
@@ -111,7 +112,7 @@ trap cleanup EXIT INT TERM
 # silently diverged; it is now generated on every launch. All of these modules
 # must land in the same directory — the dashboard imports them by name.
 echo "1/3 Deploying bridge to $WS/src ..."
-for f in marker_lineup.py lineup_solver.py lineup_dialog.py fusion_supervisor.py gnss_receiver.py tracking_preflight.py dashboard.py freed.py pose_transform.py tracking_config.py verify_tracking.py map_viewer.py bridge_headless.py depth_probe.py lidar_map_matcher.py image_alignment.py tracking_engine.py anchor_cli.py bench_fusion.py smoke_locator_lock.py smoke_lineup.py smoke_gizmo.py test_lidar_fusion.py test_image_alignment.py verify_region.py; do
+for f in marker_lineup.py lineup_solver.py lineup_dialog.py fusion_supervisor.py gnss_receiver.py tracking_preflight.py check_pipeline.py dashboard.py freed.py pose_transform.py tracking_config.py verify_tracking.py map_viewer.py bridge_headless.py depth_probe.py lidar_map_matcher.py image_alignment.py tracking_engine.py anchor_cli.py bench_fusion.py smoke_locator_lock.py smoke_lineup.py smoke_gizmo.py test_lidar_fusion.py test_image_alignment.py verify_region.py; do
     cp "$DIR/$f" "$WS/src/$f" || exit 1
 done
 # Install the bundled scan beside the relative-path configuration.
@@ -184,6 +185,80 @@ docker exec -u admin "$CONTAINER" pip3 install -q "open3d>=0.18" 2>/dev/null || 
 echo "    ensuring PyOpenGL is installed..."
 docker exec -u admin "$CONTAINER" pip3 install -q PyOpenGL 2>/dev/null || echo "    ⚠️  PyOpenGL install failed (non-fatal)"
 
+# ── NumPy ABI guard ───────────────────────────────────────────────────────────
+# The container image ships NumPy 2.x in /usr/local/lib/python3.10/dist-packages,
+# but ROS Humble's cv_bridge and cv2 are compiled against the NumPy 1.x C ABI.
+# With NumPy 2 ahead of them on sys.path they fail at import with
+# "_ARRAY_API not found" -> "numpy.core.multiarray failed to import". That takes
+# out map_viewer, lineup_dialog and bridge_headless, so the dashboard dies
+# before its window ever opens -- while SLAM comes up fine, which makes it look
+# like the pipeline "half booted".
+#
+# This pin used to sit in the cold-start branch above, silenced with
+# >/dev/null 2>&1. Two ways that failed: a warm start (container already up)
+# skipped it entirely, and on a cold start pip can run before the container has
+# working network, in which case nothing reported it. It now runs on every
+# launch, says what it is doing, and the imports are verified before anything
+# that needs them is started.
+#
+# Keep it at numpy<2. cupy-cuda12x in this image wants numpy>=2.0 and pip will
+# say so -- that warning is expected and harmless here, nothing in this project
+# imports cupy, whereas the dashboard cannot start without cv_bridge and cv2.
+echo "    checking NumPy ABI (cv_bridge/cv2 need numpy<2)..."
+if ! docker exec -u admin "$CONTAINER" \
+        python3 -c 'import numpy,sys; sys.exit(0 if numpy.__version__.split(".")[0] == "1" else 1)' 2>/dev/null; then
+    echo "    NumPy 2.x is in front -- pinning to numpy<2 (takes a few seconds)..."
+    docker exec -u admin "$CONTAINER" python3 -m pip install -q 'numpy<2' \
+        || echo "    ⚠️  numpy<2 install reported an error"
+fi
+if ! docker exec -u admin "$CONTAINER" /bin/bash -c \
+        "source /opt/ros/humble/setup.bash && python3 -c 'import numpy, cv2, cv_bridge'" 2>/dev/null; then
+    echo "❌ cv_bridge/cv2 cannot be imported in the container, so the dashboard will not start."
+    echo "   Reproduce the error with:"
+    echo "     docker exec -u admin $CONTAINER /bin/bash -c 'source /opt/ros/humble/setup.bash && python3 -c \"import cv2, cv_bridge\"'"
+    exit 1
+fi
+echo "    NumPy $(docker exec -u admin "$CONTAINER" python3 -c 'import numpy; print(numpy.__version__)' 2>/dev/null) -- cv_bridge/cv2 import OK"
+
+# ── cuVSLAM component guard ───────────────────────────────────────────────
+# The container is ephemeral, so ros-humble-isaac-ros-visual-slam has to be
+# reinstalled into every fresh one. That install used to run once during cold
+# start, silenced -- and when it failed nothing said so. The failure then hid
+# for the rest of the session: the launch below still starts a
+# component_container, but with no cuVSLAM component to load into it, so no
+# /visual_slam node appears and /visual_slam/tracking/odometry never
+# publishes. Everything else looks healthy -- the camera streams at 90 Hz, the
+# dashboard opens, the scan loads -- while there is simply no camera pose, so
+# tracking never validates and auto lineup waits forever for a fresh pose it
+# cannot get. Observed here: the whole NITROS/GXF chain was missing too.
+#
+# Checked on every launch: a warm container that came up without it stays
+# broken until something notices, and only this check ever will.
+echo "    checking Isaac ROS cuVSLAM component..."
+vslam_present() {
+    docker exec -u admin "$CONTAINER" /bin/bash -c \
+        "source /opt/ros/humble/setup.bash && ros2 component types 2>/dev/null | grep -q isaac_ros_visual_slam"
+}
+if ! vslam_present; then
+    echo "    cuVSLAM component missing -- installing ros-humble-isaac-ros-visual-slam..."
+    docker exec -u root "$CONTAINER" /bin/bash -c \
+        "DEBIAN_FRONTEND=noninteractive apt-get update && \
+         DEBIAN_FRONTEND=noninteractive apt-get install -y ros-humble-isaac-ros-visual-slam" \
+        2>&1 | tail -5
+fi
+if ! vslam_present; then
+    echo "❌ The cuVSLAM component is not in the container, so there will be no camera"
+    echo "   pose at all: tracking cannot validate and auto lineup can never lock."
+    echo "   Check the container's network, then install it by hand:"
+    echo "     docker exec -u root $CONTAINER apt-get install -y ros-humble-isaac-ros-visual-slam"
+    exit 1
+fi
+echo "    cuVSLAM component present"
+
+# SDK 2.55.1's RSUSB IMU reader predates the firmware's 38-byte report format.
+# Apply the upstream fix; disabling the IMU would break visual-inertial SLAM.
+bash "$DIR/ensure_realsense_imu.sh" "$CONTAINER" || exit 1
+
 # -e VP_ENABLE_DEPTH is required, not decorative: the launch file reads it with
 # os.environ inside the container, and docker exec forwards nothing by default.
 # Without this the variable is set on the host, silently never arrives, and
@@ -193,10 +268,22 @@ docker exec -u admin -d -w /workspaces/isaac_ros-dev \
     "$CONTAINER" /bin/bash -c \
     "source /opt/ros/humble/setup.bash && source install/setup.bash && \
      export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:\$(find /workspaces/isaac_ros-dev/install -type d -name lib | grep gxf | tr '\n' ':') && \
-     $LAUNCH_CMD"
+     $LAUNCH_CMD > /tmp/hyperfusion-slam.log 2>&1"
 
-echo "    waiting for SLAM to come up..."
-sleep 15
+DEPTH_CHECK_ARGS=()
+case "${VP_ENABLE_DEPTH:-0}" in
+    0|false|no|'') ;;
+    *) DEPTH_CHECK_ARGS=(--require-depth) ;;
+esac
+if ! docker exec -u admin \
+        -e VP_TRACKING_CONFIG=/workspaces/isaac_ros-dev/src/tracking.yaml \
+        -w /workspaces/isaac_ros-dev "$CONTAINER" /bin/bash -c \
+        'source /opt/ros/humble/setup.bash && source install/setup.bash &&
+         python3 src/check_pipeline.py "$@"' pipeline-check "${DEPTH_CHECK_ARGS[@]}"; then
+    echo "❌ Stereo / IMU / SLAM startup check failed. Recent camera/SLAM logs:"
+    docker exec -u admin "$CONTAINER" tail -n 30 /tmp/hyperfusion-slam.log
+    exit 1
+fi
 
 # Cap auto-exposure. The RealSense default AE limit is 200 ms; at 90 fps that
 # smears every frame while the rig moves, cuVSLAM loses visual tracking, falls

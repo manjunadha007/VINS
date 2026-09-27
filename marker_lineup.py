@@ -127,7 +127,16 @@ def marker_heading_seeds(observation):
     marker_to_locator[:3, :3] = rpy_to_matrix(0, 0, np.pi / 2)
     for optical_marker in optical_marker_poses(observation):
         slam_locator = observation.T_slam_image @ T_BODY_OPTICAL @ optical_marker @ marker_to_locator
-        for degrees in range(0, 360, 15):
+        # 10 deg, not 15. Half a step of yaw about the marker leaves the seed
+        # camera 2*d*sin(step/2) out, and that grows with the horizontal marker
+        # distance d: 15 deg is 89 mm at 0.7 m, which the coarse screen still
+        # recovers from, but 121 mm at 0.9 m, which it does not -- the level-8
+        # stage wanders 33 deg off, trips the 20 deg hint bound, and the solve
+        # is rejected with "only 76% of the view lands on the scan", pointing
+        # the operator at scan scale and marker width when the only problem is
+        # standing 20 cm too far back. 10 deg keeps the offset under ~80 mm out
+        # to ~1.2 m for 24 more measures, ~0.2 s against a 12 s search budget.
+        for degrees in range(0, 360, 10):
             R = so3_exp(target[:3, 2] * np.radians(degrees))
             rotated = target.copy()
             rotated[:3, :3] = R @ target[:3, :3]

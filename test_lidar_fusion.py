@@ -1079,5 +1079,179 @@ class TestSyntheticRoomICP(unittest.TestCase):
         self.assertIsNone(m.update_depth(depth, self.K, T_true, timestamp=1.0))
 
 
+class TestOverlayFramePairing(unittest.TestCase):
+    """The overlay must be drawn from the pose belonging to its own frame.
+
+    Pairing the newest odometry sample with a picture that is a frame or two
+    old slides the scan across the image by however far the camera travelled
+    in between. The error is zero while the rig is parked, which is what made
+    a single-frame lineup look correct while live tracking drifted.
+    """
+
+    K = np.array([[430., 0., 424.], [0., 430., 240.], [0., 0., 1.]])
+    POSE = ((0.0, 0.0, 1.5), (0, 0, 0, 1))
+
+    class _Recorder:
+        """Stands in for the edge aligner, keeping what it was asked to draw."""
+        available = True
+
+        def __init__(self):
+            self.calls = []
+
+        def _record(self, gray, K, T_map_cam):
+            self.calls.append((gray, K, np.asarray(T_map_cam, dtype=float).copy()))
+
+        def overlay(self, gray, K, T_map_cam, colour=(0, 255, 255)):
+            self._record(gray, K, T_map_cam)
+            return gray
+
+        def score(self, gray, K, T_map_cam):
+            self._record(gray, K, T_map_cam)
+            return 0.5
+
+    def _matcher(self):
+        m = matcher()
+        m.edge_aligner = self._Recorder()
+        m.is_aligned = True
+        m.T_slam_to_map = rigid((0, 0, 30), (1.0, -2.0, 0.5))
+        return m
+
+    @staticmethod
+    def _gray(fill=0):
+        return np.full((480, 848), fill, dtype=np.uint8)
+
+    def test_overlay_asks_for_the_pose_at_the_frames_own_stamp(self):
+        m = self._matcher()
+        m.set_image(self._gray(), self.K, 1234.5)
+        asked = []
+
+        def pose_at(stamp):
+            asked.append(stamp)
+            return self.POSE
+
+        self.assertIsNotNone(m.image_overlay(pose_at))
+        self.assertEqual(asked, [1234.5])
+
+    def test_overlay_uses_the_paired_pose_not_a_later_one(self):
+        m = self._matcher()
+        m.set_image(self._gray(), self.K, 10.0)
+        m.image_overlay(lambda stamp: self.POSE)
+        used = m.edge_aligner.calls[-1][2]
+        paired = make_transform(*self.POSE)
+        np.testing.assert_allclose(used, m.T_slam_to_map @ paired, atol=1e-12)
+        # The pose 400 mm further on -- what `latest_pose` would have supplied
+        # mid-move -- must not be what got drawn.
+        moved = make_transform((0.4, 0.0, 1.5), (0, 0, 0, 1))
+        self.assertFalse(np.allclose(used, m.T_slam_to_map @ moved, atol=1e-3))
+
+    def test_unpairable_frame_draws_nothing_rather_than_the_wrong_pose(self):
+        m = self._matcher()
+        m.set_image(self._gray(), self.K, 10.0)
+        self.assertIsNone(m.image_overlay(lambda stamp: None))
+        self.assertEqual(m.edge_aligner.calls, [])
+
+    def test_lineup_score_is_paired_the_same_way(self):
+        m = self._matcher()
+        m.set_image(self._gray(), self.K, 77.0)
+        asked = []
+
+        def pose_at(stamp):
+            asked.append(stamp)
+            return self.POSE
+
+        self.assertIsNotNone(m.image_lineup(pose_at))
+        self.assertEqual(asked, [77.0])
+        self.assertIsNone(m.image_lineup(lambda stamp: None))
+
+    def test_a_plain_pose_is_still_accepted(self):
+        """Tools and tests that already hold one pose keep working."""
+        m = self._matcher()
+        m.set_image(self._gray(), self.K, 5.0)
+        T = make_transform(*self.POSE)
+        self.assertIsNotNone(m.image_overlay(T))
+        np.testing.assert_allclose(m.edge_aligner.calls[-1][2],
+                                   m.T_slam_to_map @ T, atol=1e-12)
+
+    def test_frame_and_stamp_are_replaced_together(self):
+        """One atomic tuple: no reader sees a new stamp on the old picture."""
+        m = self._matcher()
+        second = self._gray(7)
+        m.set_image(self._gray(), self.K, 1.0)
+        m.set_image(second, self.K, 2.0)
+        seen = []
+        m.image_overlay(lambda stamp: (seen.append(stamp), self.POSE)[1])
+        self.assertEqual(seen, [2.0])
+        self.assertIs(m.edge_aligner.calls[-1][0], second)
+
+    def test_no_frame_yet_is_not_an_error(self):
+        m = self._matcher()
+        self.assertIsNone(m.image_overlay(lambda stamp: self.POSE))
+        self.assertIsNone(m.image_lineup(lambda stamp: self.POSE))
+
+
+
+try:                                    # the dashboard needs rclpy + PyQt5,
+    import dashboard as _dashboard      # which only the container provides
+    _HAS_DASHBOARD = True
+except Exception:                       # pragma: no cover - host test runs
+    _dashboard = None
+    _HAS_DASHBOARD = False
+
+
+@unittest.skipUnless(_HAS_DASHBOARD, "dashboard needs rclpy/PyQt5")
+class TestDashboardOverlayWiring(unittest.TestCase):
+    """`_refresh_ar_overlay` must hand the matcher a per-frame pose lookup.
+
+    Locks the wiring, not just the matcher's contract: the regression was the
+    dashboard passing `engine.latest_pose` -- one pose, sampled when the
+    overlay happened to run -- instead of `engine.pose_at`, which answers for
+    the frame actually being drawn on.
+    """
+
+    class _Engine:
+        def __init__(self):
+            self.asked = []
+
+        def pose_at(self, stamp, **kw):
+            self.asked.append(stamp)
+            return (0.0, 0.0, 1.5), (0, 0, 0, 1)
+
+        @property
+        def latest_pose(self):
+            raise AssertionError("the overlay must not use latest_pose")
+
+    class _Matcher:
+        is_aligned = True
+
+        def __init__(self):
+            self.handed = None
+
+        def image_overlay(self, pose):
+            self.handed = pose
+            # Stand in for the stored frame: ask about one known stamp.
+            return pose(4242.0)
+
+    def _stub(self):
+        stub = _dashboard.HyperFusionApp.__new__(_dashboard.HyperFusionApp)
+        stub._ar_overlay_on = True
+        stub._lineup = None
+        stub._ar_frame_n = 9            # the next tick is the drawing one
+        stub._ar_overlay = None
+        stub.engine = self._Engine()
+        stub.lidar_matcher = self._Matcher()
+        return stub
+
+    def test_overlay_is_drawn_from_the_pose_at_the_frames_stamp(self):
+        stub = self._stub()
+        _dashboard.HyperFusionApp._refresh_ar_overlay(stub)
+        self.assertIsNotNone(stub.lidar_matcher.handed,
+                             "the matcher was never asked to draw")
+        self.assertTrue(callable(stub.lidar_matcher.handed),
+                        "a per-frame pose lookup must be handed over, not one pose")
+        self.assertEqual(stub.engine.asked, [4242.0],
+                         "the pose must be looked up at the frame's own stamp")
+        self.assertIsNotNone(stub._ar_overlay)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

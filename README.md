@@ -422,9 +422,12 @@ bridge (sub-millisecond), UDP, and Unreal's own render pipeline.
 
 To reduce it:
 
-* SLAM already runs at 90 fps (640x360x90). Higher resolution would help accuracy
-  but 848x480 does not resolve as a stereo pair on this D455 over its current USB
-  path — see the note at the top of [isaac_vp.launch.py](isaac_vp.launch.py).
+* SLAM runs at 90 fps. [isaac_vp.launch.py](isaac_vp.launch.py) configures
+  848x480x90; the earlier claim that this D455 could not resolve 848x480 as a
+  stereo pair was a USB 2 negotiation, not a device limit. Over USB 3.2 the unit
+  offers IR1, IR2 and depth all at 848x480 up to 90 Hz. If the profile list ever
+  looks truncated, check the link type before blaming the camera:
+  `rs-enumerate-devices | grep -i 'usb type'`.
 * Set `network.send_rate_hz: 0` to emit a packet the instant each pose arrives
   rather than on a fixed timer.
 * Only then reach for `tracking.lead_time_s`, which predicts ahead using Isaac's
@@ -441,6 +444,7 @@ not.
 
 | Symptom | Cause |
 |---|---|
+| Camera preview stalls when IMU is enabled; `control_transfer` errors or `Motion Module force pause` | The Isaac image's librealsense 2.55.1 RSUSB reader lacks support for the newer firmware's IMU report format. `./launch_isaac.sh` now installs the [upstream IMU fix](patches/README.md), preserves the original SDK binary, and checks sustained stereo, depth, IMU and SLAM data before starting the dashboard. Keep gyro, accel and Isaac IMU fusion enabled, as in v1.4. Camera/SLAM logs are in `/tmp/hyperfusion-slam.log` inside the container. |
 | Nothing moves in Unreal | Camera ID mismatch, wrong `unreal_ip`, or UDP 11111 blocked. Run `calibrate_axes.py` to isolate — if that moves the camera, the problem is upstream in SLAM. |
 | Virtual camera moves the wrong way on one axis | Axis sign. See calibration above. |
 | Dashboard stops responding when **maximized** | Restart through `./launch_isaac.sh` to load the current renderer. The viewport now uses Qt’s managed `paintGL()` framebuffer lifecycle, retains swap interval 0, and avoids repeated status-style layout invalidation. Regression checks cover framebuffer resizing and native window-manager replies in the Isaac container; see `VERSION.md` for results. |
@@ -463,7 +467,7 @@ not.
 | Correction seems very slow to arrive | By design — `lidar.max_slew_m_s` (default 0.02) caps how fast a fix may move the camera, so a 100 mm drift takes ~5 s to come out invisibly. Raise it if you want faster convergence and can accept visible motion. |
 | Status shows `TRACKING LOST — HOLDING` | SLAM stopped publishing. The last good pose is held rather than teleporting the camera. Re-initialise with slow motion across textured geometry. |
 | Ground zero anchors in the wrong place | `aruco.marker_size_m` does not match the printed marker, or `camera_info` never arrived so fallback intrinsics were used (the console reports which). |
-| SLAM node exits at startup with 60 fps profile | D455/USB cannot sustain it. Use the default launch, or see the notes in `isaac_vp.launch.py`. |
+| SLAM node exits at startup, or the profile list is missing modes (848x480, 60/90 fps) | Almost always a USB 2 negotiation, not a device or bandwidth limit: librealsense truncates the profile list severely on USB 2, and the IR pair alone needs ~586 Mbps at 848x480x90 (depth adds the same again). Check `rs-enumerate-devices \| grep -i 'usb type'` — it must report 3.2. Re-seat into a USB 3 port, and over a long run use an active optical cable rated 5 Gbps Gen 1 and powered at the camera end; a USB 2 fallback cable reproduces exactly this symptom. See the notes at the top of `isaac_vp.launch.py`. |
 
 ## Tests
 

@@ -89,8 +89,16 @@ class MarkerHeadingGeometryTests(unittest.TestCase):
             np.testing.assert_allclose(transformed[:3, 3], obs.T_map_locator[:3, 3], atol=1e-12)
             np.testing.assert_allclose(transformed[:3, 2], obs.up_map, atol=1e-12)
             positions.append((seed @ obs.T_slam_image)[:3, 3])
-        self.assertEqual({angle for _, _, angle in seeds}, set(range(0, 360, 15)))
-        self.assertGreater(np.linalg.norm(positions[0]-positions[12]), .5)
+        # The invariant is an evenly spaced full circle, not one particular
+        # step -- the step is tuned against marker distance and has moved
+        # before. Derive it so retuning does not need this test edited.
+        angles = [angle for _, _, angle in seeds]
+        step = angles[1] - angles[0]
+        self.assertEqual(360 % step, 0)
+        self.assertEqual(set(angles), set(range(0, 360, step)))
+        # Half a turn round the orbit must land the camera somewhere genuinely
+        # different; that is what "orbits the camera" means here.
+        self.assertGreater(np.linalg.norm(positions[0]-positions[angles.index(180)]), .5)
 
     def test_input_locator_rotation_is_ignored_and_tilted_scan_up_is_respected(self):
         from marker_lineup import marker_heading_seeds

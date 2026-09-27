@@ -345,8 +345,7 @@ class LidarMapMatcher:
         self.edge_aligner = (EdgeAligner(cfg) if _HAS_EDGE_ALIGN else None)
         self._mesh_vertices = None
         self._mesh_triangles = None
-        self._gray = None
-        self._gray_K = None
+        self._frame = None
 
         self.diagnostics = {
             "lidar_aligned": False,
@@ -482,37 +481,55 @@ class LidarMapMatcher:
                                           self._mesh_triangles,
                                           scale=self.map_scale)
 
-    def set_image(self, gray, K):
-        """Latest camera frame, for the lineup check and overlay."""
-        self._gray = gray
-        self._gray_K = None if K is None else np.asarray(K, dtype=float)
+    def set_image(self, gray, K, stamp=None):
+        """Latest camera frame, for the lineup check and overlay.
 
-    def image_lineup(self, T_slam_cam):
+        The stamp travels with the frame so both can be drawn from the pose
+        that belongs to *this* picture instead of the newest one to arrive.
+        Kept as one tuple on purpose: the GUI thread reads it while the ROS
+        callback replaces it, and a half-updated pair would put a fresh pose
+        on a stale frame -- the very error the stamp is here to prevent.
+        """
+        self._frame = (gray, None if K is None else np.asarray(K, dtype=float),
+                       None if stamp is None else float(stamp))
+
+    def _paired_frame(self, pose):
+        """(gray, K, T_slam_cam) for one frame, or None if it cannot be paired.
+
+        `pose` is either a pose or a callable taking the frame's stamp and
+        returning the pose recorded at that instant. The callable form is what
+        holds the overlay still: the stamp is chosen and used inside a single
+        atomic read of the frame, so no newer picture can arrive between
+        picking the pose and drawing on the image it belongs to.
+        """
+        frame = self._frame
+        if (self.edge_aligner is None or not self.edge_aligner.available
+                or frame is None or not self.is_aligned):
+            return None
+        gray, K, stamp = frame
+        if gray is None or K is None:
+            return None
+        T = self._as_transform(pose(stamp) if callable(pose) else pose)
+        return None if T is None else (gray, K, T)
+
+    def image_lineup(self, pose):
         """How well the camera picture lines up with the scan right now.
 
         Read-only: returns the score or None, and never moves the pose.
         """
-        if (self.edge_aligner is None or not self.edge_aligner.available
-                or self._gray is None or self._gray_K is None
-                or not self.is_aligned or T_slam_cam is None):
+        paired = self._paired_frame(pose)
+        if paired is None:
             return None
-        T = self._as_transform(T_slam_cam)
-        if T is None:
-            return None
-        return self.edge_aligner.score(self._gray, self._gray_K,
-                                       self.T_slam_to_map @ T)
+        gray, K, T = paired
+        return self.edge_aligner.score(gray, K, self.T_slam_to_map @ T)
 
-    def image_overlay(self, T_slam_cam):
+    def image_overlay(self, pose):
         """The camera frame with the scan's edges drawn on it, or None."""
-        if (self.edge_aligner is None or not self.edge_aligner.available
-                or self._gray is None or self._gray_K is None
-                or not self.is_aligned):
+        paired = self._paired_frame(pose)
+        if paired is None:
             return None
-        T = self._as_transform(T_slam_cam)
-        if T is None:
-            return None
-        return self.edge_aligner.overlay(self._gray, self._gray_K,
-                                         self.T_slam_to_map @ T)
+        gray, K, T = paired
+        return self.edge_aligner.overlay(gray, K, self.T_slam_to_map @ T)
 
     def set_map_scale(self, metres_per_unit):
         """Set the map file's units, in metres per file unit.

@@ -422,6 +422,11 @@ class MapImportThread(QThread):
 # ──────────────────────────────────────────────────────
 class HyperFusionApp(QMainWindow):
     marker_lineup_finished = pyqtSignal(object)
+    # One definition so the live state updates can't re-inflate the compact header.
+    _SESSION_BADGE_CSS = (
+        "background:{bg}; color:{fg}; border-radius:6px; "
+        "padding:5px 14px; font-size:11px;"
+    )
     _marker_request = None
     _marker_detection_sample = None
     _find_thread = None
@@ -862,34 +867,41 @@ class HyperFusionApp(QMainWindow):
         self._build_menu()
         shell = QWidget()
         layout = QVBoxLayout(shell)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(14)
+        layout.setContentsMargins(20, 8, 20, 12)
+        layout.setSpacing(9)
         header = QHBoxLayout()
+        header.setSpacing(12)
         brand = QVBoxLayout()
+        # Header is pure chrome — keep it thin so the workspace below gets the pixels.
+        brand.setContentsMargins(0, 0, 0, 0)
+        brand.setSpacing(0)
         title = QLabel("HyperFusion")
-        title.setFont(QFont("DejaVu Sans", 22, QFont.Bold))
-        title.setStyleSheet("font-size:26px;font-weight:600;color:#e4edf7;")
+        title.setFont(QFont("DejaVu Sans", 15, QFont.Bold))
+        title.setStyleSheet("font-size:18px;font-weight:600;color:#e4edf7;")
         brand.addWidget(title)
         subtitle = QLabel("VIRTUAL PRODUCTION  /  CAMERA TRACKING")
-        subtitle.setStyleSheet("color:#8295ad; font-size:10px; letter-spacing:2px;")
+        subtitle.setStyleSheet("color:#8295ad; font-size:9px; letter-spacing:2px;")
         brand.addWidget(subtitle)
         header.addLayout(brand)
         header.addStretch()
         self.lbl_session = QLabel("AWAITING LINEUP")
-        self.lbl_session.setStyleSheet("background:#253448; color:#a6cae8; border-radius:6px; padding:10px 16px;")
-        header.addWidget(self.lbl_session)
+        self.lbl_session.setStyleSheet(self._SESSION_BADGE_CSS.format(bg="#253448", fg="#a6cae8"))
+        header.addWidget(self.lbl_session, 0, Qt.AlignVCenter)
         layout.addLayout(header)
 
         telemetry = QHBoxLayout()
+        telemetry.setSpacing(10)
         self.health_cards = {}
         for key, title in (("motion", "01  MOTION"), ("scan", "02  SCAN VALIDATION"), ("gnss", "03  RTK POSITION")):
             card = QFrame()
             card.setStyleSheet("QFrame{background:#18212d;border:1px solid #2b394d;border-radius:8px;}")
             column = QVBoxLayout(card)
+            column.setContentsMargins(11, 5, 11, 6)
+            column.setSpacing(1)
             label = QLabel(title)
-            label.setStyleSheet("border:none;color:#91a4bb;font-size:10px;")
+            label.setStyleSheet("border:none;color:#91a4bb;font-size:9px;")
             value = QLabel("Waiting for input")
-            value.setStyleSheet("border:none;color:#dce4ef;font-size:13px;font-weight:600;")
+            value.setStyleSheet("border:none;color:#dce4ef;font-size:12px;font-weight:600;")
             column.addWidget(label)
             column.addWidget(value)
             self.health_cards[key] = value
@@ -1220,7 +1232,8 @@ class HyperFusionApp(QMainWindow):
             self._image_stamp = self._stamp_seconds(msg)
             self._image_sample = (gray, self._image_stamp, self._image_mono)
             if self.lidar_matcher is not None:
-                self.lidar_matcher.set_image(gray, self.engine.aruco_K)
+                self.lidar_matcher.set_image(gray, self.engine.aruco_K,
+                                             self._image_stamp)
 
             # Downscale display frame (320x200)
             disp = gray.copy()
@@ -2008,11 +2021,16 @@ class HyperFusionApp(QMainWindow):
         self._ar_frame_n += 1
         if self._ar_frame_n % 10:            # ~6 Hz at a 60 Hz refresh
             return
-        pose = self.engine.latest_pose
-        if pose is None:
-            return
+        # `pose_at`, never `latest_pose`. The scan has to be projected with
+        # the pose recorded at this frame's own timestamp; pairing the newest
+        # odometry sample with a picture that is a frame or two old slides the
+        # scan across the image by however far the camera travelled in
+        # between. That error is zero while the rig is parked, which is why a
+        # single-frame lineup looked perfect and live tracking drifted.
+        # A None result (no pose within the pairing tolerance) leaves the last
+        # overlay on screen rather than blanking it.
         try:
-            self._ar_overlay = matcher.image_overlay(pose)
+            self._ar_overlay = matcher.image_overlay(self.engine.pose_at)
         except Exception as exc:
             print(f"[Overlay] error: {exc}")
             self._ar_overlay = None
@@ -2439,7 +2457,7 @@ class HyperFusionApp(QMainWindow):
             if self._lineup_frame_n % 30 == 0:      # ~2 Hz at 60 Hz refresh
                 try:
                     self._image_lineup = matcher.image_lineup(
-                        self.engine.latest_pose)
+                        self.engine.pose_at)
                 except Exception as exc:
                     print(f"[LiDAR] lineup error: {exc}")
                     self._image_lineup = None
@@ -2541,7 +2559,7 @@ class HyperFusionApp(QMainWindow):
                   "#9cc9ed" if state == "RTK_ASSISTED" else
                   "#ebc07d" if state in ("DEGRADED", "ALIGNING", "VERIFYING", "POSE ONLY") else "#ee9a9a")
         self.lbl_session.setText(state.replace("_", " "))
-        self._set_status_style(self.lbl_session, f"background:#202d3c; color:{colour}; border-radius:6px; padding:10px 16px;")
+        self._set_status_style(self.lbl_session, self._SESSION_BADGE_CSS.format(bg="#202d3c", fg=colour))
         mode = "Enabled" if self.streaming_enabled else "Paused"
         self.lbl_status.setText(
             f"{status['reason']}\n"
