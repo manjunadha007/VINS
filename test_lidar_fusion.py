@@ -720,6 +720,32 @@ class TestSyntheticRoomICP(unittest.TestCase):
                   [0.0, 337.0, 180.0],
                   [0.0, 0.0, 1.0]])
 
+    def test_imperfect_scan_accepts_lineup_and_continuous_checks(self):
+        from tracking_config import load_config
+        from pathlib import Path
+        cfg = load_config(str(Path(__file__).with_name("tracking.yaml")), verbose=False)["lidar"]
+        cfg = dict(cfg, map_scale=1.0)  # synthetic room coordinates are already metres
+        camera = make_transform((0, 0, 1.5), (0, 0, 0, 1))
+        depth = self._render_depth(camera)
+        # A strip of the room differs from the saved scan by 40 cm.
+        depth[:, :80] += 400
+        matcher = self._matcher(**dict(cfg, seed_yaw_steps=1))
+        match = matcher.solve_from_hint(depth, self.K, camera, np.eye(4))
+        self.assertTrue(match.ok, match.reason)
+        self.assertGreaterEqual(match.verify_score, 0.75)
+        self.assertLess(match.verify_score, 0.95)
+        distance, angle = matcher._camera_delta(match.T_slam_to_map, np.eye(4), camera)
+        self.assertLess(distance, 0.02)
+        self.assertLess(angle, 0.3)
+        matcher.accept_hint_solution(match, "test")
+        update = matcher.update_depth(depth, self.K, camera, timestamp=100.)
+        self.assertTrue(update.ok, update.reason)
+        # Explicit strict settings still work; low agreement is never relabelled.
+        strict = self._matcher(**dict(cfg, min_verify_score=0.95, seed_yaw_steps=1))
+        rejected = strict.solve_from_hint(depth, self.K, camera, np.eye(4))
+        self.assertFalse(rejected.ok)
+        self.assertIn("need 95%", rejected.reason)
+
     def test_recovers_injected_translation_drift(self):
         m = self._matcher()
         # Truth: camera at (0, 0, 1.5) looking down +X. SLAM believes it is

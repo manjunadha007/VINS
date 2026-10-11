@@ -166,6 +166,7 @@ class TrackingEngine:
         self._pose_history = deque(maxlen=500)
         self._last_sensor_stamp = None
         self._last_pose_mono = None
+        self._last_odometry_mono = None
         self._last_depth_mono = None
         self._depth_stamp = None
         self._depth_sample = None
@@ -230,7 +231,7 @@ class TrackingEngine:
         return self._depth_mm is not None
 
     # ── pose pipeline ────────────────────────────────────────────────────────
-    def accept_pose(self, position, quaternion, linear, angular, stamp=None):
+    def accept_pose(self, position, quaternion, linear, angular, stamp=None, *, source=None):
         """Single entry point for every incoming SLAM pose.
 
         Order matters: absorb tracker snaps first, then pin if the rig is
@@ -239,6 +240,12 @@ class TrackingEngine:
         """
         now = time.time()
         mono = time.monotonic()
+        # Prefer odometry's velocity while that topic is fresh. A VO sample
+        # must not suppress the next VO sample: using last_vio_time here
+        # throttled a VO-only stream to one pose per second.
+        if (source == "vo" and self._last_odometry_mono is not None
+                and 0 <= mono - self._last_odometry_mono <= self.stale_timeout):
+            return False
         values = np.concatenate([np.asarray(v, dtype=float).ravel()
                                  for v in (position, quaternion, linear, angular)])
         if values.size != 13 or not np.isfinite(values).all() or np.linalg.norm(quaternion) < 1e-9:
@@ -272,6 +279,8 @@ class TrackingEngine:
             self.pose_updates += 1
             self._last_pose_mono = mono
             if not snapped:
+                if source == "odometry":
+                    self._last_odometry_mono = mono
                 self._pose_history.append((stamp, mono, np.array(position, copy=True),
                                            np.array(quaternion, copy=True)))
 
@@ -757,6 +766,7 @@ class TrackingEngine:
             self.confirm_lineup()
             self._pose_history.clear()
             self._last_sensor_stamp = None
+            self._last_odometry_mono = None
             self.transformer.clear_ground_zero()
             self.clear_anchor_target()
             self.map_aligned = False

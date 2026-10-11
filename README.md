@@ -7,6 +7,9 @@ centre, set its heading, and enable the checkbox. It turns green only when the
 camera is locked with fresh scan fusion. Marker settings and detailed diagnostics
 are in **Setup**. Follow [LINEUP_LITE.md](LINEUP_LITE.md) for placement, indicator
 states and recovery. The 3D camera and FreeD follow the same supervised pose.
+After an accepted lineup, fresh stereo/IMU motion continues even when scan
+checks fail or expire; amber **Camera tracking** shows that scan validation is
+unavailable. Matching requires 75% surface agreement to allow imperfect scans.
 
 See [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) for the project inventory,
 fallback behavior and remaining calibration work, and [RTK_SETUP.md](RTK_SETUP.md)

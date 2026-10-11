@@ -1655,6 +1655,11 @@ class HyperFusionApp(QMainWindow):
             elif status["state"] in ("HOLD", "RELINEUP"):
                 state, title, colour = "held", "Auto lineup · Tracking held", "#ee9a9a"
                 detail = status["reason"]
+            elif (self.engine.fusion.enabled and aligned
+                    and status["state"] == "DEGRADED" and status["output_allowed"]
+                    and not self.engine._output_held):
+                state, title, colour = "tracking", "Auto lineup · Camera tracking", "#ebc07d"
+                detail = status["reason"]
             else:
                 state, title, colour = "verifying", "Auto lineup · Validating", "#ebc07d"
                 detail = ("Fusion supervision is disabled in tracking.yaml." if not self.engine.fusion.enabled
@@ -2306,22 +2311,20 @@ class HyperFusionApp(QMainWindow):
         self._accept_pose(
             (p.x, p.y, p.z), (o.x, o.y, o.z, o.w),
             (lin.x, lin.y, lin.z), (ang.x, ang.y, ang.z),
-            stamp=self._stamp_seconds(msg))
+            stamp=self._stamp_seconds(msg), source="odometry")
 
     def vo_pose_callback(self, msg):
-        """Visual-odometry pose, used only until odometry starts arriving.
+        """Visual-odometry pose, used when richer odometry is unavailable.
 
         Both topics carry the same tracking result; odometry is preferred because
         it also carries velocity. Letting both drive the output would mean two
         writers fighting over the stream.
         """
-        if self.last_vio_time and (time.time() - self.last_vio_time) < 1.0:
-            return
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
         self._accept_pose((p.x, p.y, p.z), (o.x, o.y, o.z, o.w),
                           (0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
-                          stamp=self._stamp_seconds(msg))
+                          stamp=self._stamp_seconds(msg), source="vo")
 
     @staticmethod
     def _stamp_seconds(msg):
@@ -2333,7 +2336,7 @@ class HyperFusionApp(QMainWindow):
         except AttributeError:
             return None
 
-    def _accept_pose(self, position, quaternion, linear, angular, stamp=None):
+    def _accept_pose(self, position, quaternion, linear, angular, stamp=None, *, source=None):
         """Hand a raw SLAM pose to the engine.
 
         Deliberately raw. The LiDAR map correction used to be blended into
@@ -2345,7 +2348,8 @@ class HyperFusionApp(QMainWindow):
         the engine's ground zero -- so this path stays a clean VIO stream and
         the gate keeps seeing only genuine tracker behaviour.
         """
-        self.engine.accept_pose(position, quaternion, linear, angular, stamp)
+        if not self.engine.accept_pose(position, quaternion, linear, angular, stamp, source=source):
+            return
         if self.send_on_pose:
             self._stream_freed()
 

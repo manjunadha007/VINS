@@ -52,7 +52,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.e.fusion_status()["state"], "VALIDATED")
         return self.e.freed_packet()
 
-    def test_no_output_before_lineup_and_three_checks(self):
+    def test_strict_mode_needs_lineup_and_three_checks(self):
+        self.cfg["fusion"]["allow_vio_fallback"] = False
         self.pose()
         self.check()
         self.assertIsNone(self.e.freed_packet())
@@ -64,6 +65,7 @@ class EngineTests(unittest.TestCase):
         self.assertIsNotNone(self.e.freed_packet())
 
     def test_replaying_measurement_does_not_manufacture_consensus(self):
+        self.cfg["fusion"]["allow_vio_fallback"] = False
         self.e.apply_map_alignment(np.eye(4))
         self.pose()
         m = self.check()
@@ -72,6 +74,7 @@ class EngineTests(unittest.TestCase):
         self.assertIsNone(self.e.freed_packet())
 
     def test_depth_occlusion_has_bounded_fallback_then_exact_hold(self):
+        self.cfg["fusion"]["allow_vio_fallback"] = False
         self.ready()
         self.pose(0.01)
         self.check(False)
@@ -125,6 +128,7 @@ class EngineTests(unittest.TestCase):
         self.assertGreater(packet["x_m"], 0)
 
     def test_single_wall_does_not_claim_full_validation(self):
+        self.cfg["fusion"]["allow_vio_fallback"] = False
         self.e.apply_map_alignment(np.eye(4))
         for _ in range(3):
             self.pose()
@@ -132,12 +136,117 @@ class EngineTests(unittest.TestCase):
         self.assertIsNone(self.e.freed_packet())
 
     def test_gaps_reset_recovery_streak(self):
+        self.cfg["fusion"]["allow_vio_fallback"] = False
         self.e.apply_map_alignment(np.eye(4))
         for _ in range(4):
             self.clock.t += 2
             self.pose()
             self.check()
         self.assertIsNone(self.e.freed_packet())
+
+    def test_vio_fallback_still_requires_lineup(self):
+        self.pose()
+        self.assertEqual(self.e.fusion_status()["state"], "ALIGNING")
+        self.assertIsNone(self.e.freed_packet())
+
+    def test_camera_follows_alignment_before_runtime_scan_validation(self):
+        alignment = make_transform((2, -3, 1),
+            matrix_to_quaternion(rpy_to_matrix(0, 0, np.pi/3)))
+        rig = make_transform((0.08, 0, 0.12), (0, 0, 0, 1))
+        self.e.transformer._rig = rig
+        self.e.apply_map_alignment(alignment)
+        for i in range(120):  # >1 s grace, >10 cm/5 degree recovery limits
+            x = i * 0.01
+            q = matrix_to_quaternion(rpy_to_matrix(0, i * 0.002, i * 0.005))
+            self.pose(x, q)
+            packet = freed.decode_freed_packet(self.e.freed_packet())
+            expected = alignment @ make_transform((x, 0, 0), q) @ rig
+            actual = make_transform(*self.e.camera_pose_ros_corrected())
+            np.testing.assert_allclose(actual, expected, atol=1e-12)
+            np.testing.assert_allclose([packet["x_m"], packet["y_m"], packet["z_m"]],
+                                       expected[:3, 3] * [1, -1, 1], atol=1e-4)
+            self.assertEqual(self.e.fusion_status()["state"], "DEGRADED")
+            self.assertFalse(self.e.camera_pose_now()[1])  # motion is not scan validation
+            self.assertFalse(self.e._output_held)
+
+    def test_scan_rejection_partial_geometry_and_outage_do_not_freeze_motion(self):
+        self.ready()
+        for i in range(1, 361):
+            self.pose(i * 0.01)
+            if i % 10 == 0:
+                if i <= 120:
+                    self.check(False)
+                elif i <= 240:
+                    self.check(rank=1)
+                # Remaining 2.4 seconds: depth absent; keep fresh camera poses.
+            self.e.freed_packet()
+            np.testing.assert_allclose(self.e.camera_pose_ros_corrected()[0], (i * .01, 0, 0))
+            self.assertFalse(self.e._output_held)
+            self.assertFalse(self.e._relineup_required)
+        self.assertEqual(self.e.fusion_status()["state"], "DEGRADED")
+        # Fresh checks restore green without slewing back from the lineup pose.
+        for i in range(3):
+            self.pose(3.7 + i * .01)
+            self.check()
+            self.e.freed_packet()
+            self.assertEqual(self.e.fusion_status()["state"], "VALIDATED" if i == 2 else "DEGRADED")
+            np.testing.assert_allclose(self.e.camera_pose_ros_corrected()[0], (3.7 + i * .01, 0, 0))
+
+    def test_fallback_holds_when_camera_is_rejected_or_stale(self):
+        self.e.apply_map_alignment(np.eye(4))
+        self.pose(0.2)
+        packet = self.e.freed_packet()
+        self.assertIsNotNone(packet)
+        self.assertFalse(self.pose(float("nan")))
+        self.assertEqual(self.e.freed_packet(), packet)
+        self.assertEqual(self.e.fusion_status()["state"], "HOLD")
+        self.pose(0.2)
+        self.e.freed_packet()
+        self.clock.t += 1
+        self.assertEqual(self.e.freed_packet(), packet)
+        self.assertEqual(self.e.fusion_status()["state"], "HOLD")
+
+    def test_stationary_hold_releases_for_straight_motion_without_scan_checks(self):
+        self.cfg["tracking"].update(gate_enabled=True, hold_enabled=True)
+        self.e = TrackingEngine(self.cfg, log=lambda *a: None)
+        self.ready()
+        for _ in range(60):
+            self.e.update_imu((0, 0, 0), (0, 0, 9.81))
+        self.pose()
+        self.e.freed_packet()
+        self.assertTrue(self.e.hold.is_stationary)
+        for i in range(1, 181):
+            # A straight dolly move keeps the gyro quiet; vision must release it.
+            self.e.update_imu((0, 0, 0), (0, 0, 9.81))
+            self.pose(i * .001)
+            self.e.freed_packet()
+        self.assertGreater(self.e.hold.vo_releases, 0)
+        self.assertFalse(self.e._pose_rejected)
+        self.assertEqual(self.e.fusion_status()["state"], "DEGRADED")
+        self.assertAlmostEqual(self.e.camera_pose_ros_corrected()[0][0], .18, delta=.004)
+
+    def test_vo_fallback_runs_at_camera_rate_and_yields_to_fresh_odometry(self):
+        self.e.apply_map_alignment(np.eye(4))
+        def feed(source, x):
+            return self.e.accept_pose((x, 0, 0), (0, 0, 0, 1), (0, 0, 0),
+                                      (0, 0, 0), stamp=self.clock.t, source=source)
+        self.assertTrue(feed("odometry", 0))
+        self.e.freed_packet()
+        self.clock.t += .02
+        self.assertFalse(feed("vo", 1))
+        # Switch as soon as primary odometry is stale, then consume every VO frame.
+        self.clock.t += self.e.stale_timeout
+        for i in range(90):
+            self.clock.t += 1/90
+            self.assertTrue(feed("vo", i * .01))
+            self.e.freed_packet()
+            self.assertAlmostEqual(self.e.camera_pose_ros_corrected()[0][0], i * .01)
+        self.clock.t += 1/90
+        self.assertTrue(feed("odometry", .9))
+        self.clock.t += 1/90
+        self.assertFalse(feed("vo", 2))
+        self.e.freed_packet()
+        self.assertAlmostEqual(self.e.camera_pose_ros_corrected()[0][0], .9)
 
     def test_nan_and_zero_quaternion_are_rejected(self):
         self.ready()

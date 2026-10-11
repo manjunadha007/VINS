@@ -277,12 +277,10 @@ lidar:
   # question instead — with the solution applied, how much of the depth image
   # actually lands on the scanned surface? The dashboard shows it as "On scan".
   verify_threshold_m: 0.10
-  # Was 0.55. That is loose enough to accept a confidently wrong lock: on the
-  # D455 in Room01_Scaled_UE01, solves that were 380-450 mm from the true pose
-  # still scored 0.87-0.91 and were accepted, while correct solves scored 0.98.
-  # A wrong lock is worse than no lock -- it anchors the whole fusion to the
-  # wrong place -- so the gate sits above the band the bad solves occupy.
-  min_verify_score: 0.95
+  # Require 75% depth agreement instead of 95% so incomplete/noisy scans can
+  # match. This is surface agreement, not a camera accuracy percentage.
+  # Search bounds, geometry, RMSE and correction limits still apply.
+  min_verify_score: 0.75
 
   # Heading is what an operator placing a gizmo by hand gets most wrong, and
   # what ICP is least able to recover on its own, so the lock-on tries this
@@ -331,7 +329,10 @@ fusion:
   require_lineup: true
   scan_timeout_s: 0.8
   gnss_timeout_s: 0.8
-  single_source_grace_s: 1.0
+  # After lineup, keep following fresh stereo/IMU motion when scan checks
+  # fail or arrive late. The status stays amber until scan validation recovers.
+  allow_vio_fallback: true
+  single_source_grace_s: 1.0      # applies only with allow_vio_fallback: false
   recovery_samples: 3
   min_scan_rank: 3
   depth_pose_tolerance_s: 0.035

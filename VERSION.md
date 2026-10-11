@@ -1,3 +1,21 @@
+# 2026-10-11 — v1.6 snapshot: camera keeps moving after lineup, looser scan matching
+
+Frozen as `versions/v1.6/`. v1.5's pipeline with the camera no longer freezing
+after a lineup.
+
+A VO-only pose stream is no longer throttled to one pose per second: the
+engine set `last_vio_time` on every accepted pose, VO included, so the VO
+callback's 1 s guard kept dropping its own poses. VO is now ignored only while
+odometry is fresh. After an accepted lineup, `fusion.allow_vio_fallback` (on
+by default) keeps live stereo/IMU motion running when scan checks are missing
+or failing, shown as amber **Auto lineup · Camera tracking**. Green still needs
+consecutive fresh scan checks. `lidar.min_verify_score` drops from 0.95 to 0.75
+so incomplete or noisy scans can lock.
+
+Passes 423 unit tests in the container plus the three smoke scripts. Known
+limits: not yet validated live; 0.75 sits below the 0.87-0.91 scores v1.5
+measured for wrong locks 380-450 mm off, and no test covers that case.
+
 # 2026-09-27 — v1.5 snapshot: hardware-checked startup, IMU fix in the container
 
 Frozen as `versions/v1.5/`. v1.4's tracking, made to start reliably on a

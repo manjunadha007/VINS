@@ -1,0 +1,371 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Virtual Production Camera Tracking — operator configuration
+#
+#  Every key is optional: anything you leave out falls back to the defaults in
+#  tracking_config.py. Edit this file, restart the dashboard, done — no code
+#  changes needed on set.
+# ═══════════════════════════════════════════════════════════════════════════
+
+network:
+  # ── SET THIS to the machine running Unreal Engine. ──
+  # 127.0.0.1 only works when Unreal is on this same computer. For a normal
+  # setup (tracking box + separate Unreal workstation) put the Unreal machine's
+  # LAN address here, e.g. 192.168.1.50, and make sure UDP 11111 is open.
+  unreal_ip: "127.0.0.1"
+  unreal_port: 11111
+
+  # Must match the Camera ID of the LiveLinkFreeD subject inside Unreal.
+  camera_id: 1
+
+  # 0    = send a packet for every SLAM pose (lowest latency)
+  # 60   = fixed 60 Hz, predicted between SLAM updates (recommended)
+  # 30   = match a 30 fps shoot
+  send_rate_hz: 60
+
+transform:
+  # 1.0 sends metres, which is what the FreeD spec specifies and what Unreal's
+  # LiveLinkFreeD plugin expects. Only change this if Unreal shows movement
+  # scaled by a constant factor (e.g. 100 if it wants centimetres).
+  position_scale: 1.0
+
+  # Defaults below are the derived ROS -> Unreal mapping and should be correct.
+  # If an axis moves the WRONG WAY in Unreal, flip that one sign.
+  # Run:  python3 calibrate_axes.py
+  # to move one axis at a time and see which is which.
+  position_sign: [1.0, -1.0, 1.0]   # X, Y, Z
+  pan_sign: -1.0
+  tilt_sign: -1.0
+  roll_sign: 1.0
+
+  # Constant trim, applied after conversion. Use pan_offset_deg to align the
+  # virtual camera's rest heading with your set.
+  pan_offset_deg: 0.0
+  tilt_offset_deg: 0.0
+  roll_offset_deg: 0.0
+
+  # Where the film camera's optical centre (nodal point) sits relative to the
+  # RealSense, in ROS body axes: X forward, Y left, Z up.
+  # Example: RealSense mounted 12 cm below and 5 cm behind the taking lens
+  #   translation_m: [-0.05, 0.0, 0.12]
+  rig_offset:
+    translation_m: [0.0, 0.0, 0.0]
+    rotation_deg: [0.0, 0.0, 0.0]
+
+tracking:
+  # Capture-to-render latency compensation. Start at 0. Measure your real
+  # end-to-end delay first (see README "Latency"), then dial in. Too much
+  # prediction overshoots on fast pans.
+  lead_time_s: 0.0
+
+  # Hard cap on extrapolation. If SLAM stalls, the virtual camera freezes here
+  # instead of drifting off into the void.
+  max_extrapolation_s: 0.05
+
+  # After this long with no pose, the dashboard flags INVALID and holds the last
+  # good pose rather than streaming stale or fabricated data.
+  stale_pose_timeout_s: 0.25
+
+  # 0.0 = off. Raise (0.2-0.5) only if micro-jitter is visible in the composite;
+  # it costs latency.
+  smoothing_alpha: 0.0
+
+  # Outlier gate. cuVSLAM relocalisations and loop closures can snap the pose by
+  # over a metre between two frames. Rather than let that teleport the virtual
+  # camera, the snap is absorbed into a standing offset so the output stays
+  # continuous. Verified on recorded data from this rig: peak excursion on a
+  # diverging take dropped from 138.9 m to 1.08 m, worst step 106.9 m to 146 mm.
+  #
+  # Defaults tuned against real handheld motion on this camera, whose 95th
+  # percentile step at 90 Hz was 16.3 mm. Raise the limits if you legitimately
+  # move faster than 3 m/s and see the gate rejecting real movement (the
+  # dashboard status panel reports the reject count).
+  gate_enabled: true
+  gate_max_speed_m_s: 3.0
+  gate_max_jump_m: 0.05
+  gate_max_angular_deg_s: 900.0
+  gate_max_consecutive_rejects: 15
+
+  # Stationary hold (ZUPT). With the rig physically still, pure visual odometry
+  # still creeps. The IMU can tell nothing is moving, so the output is pinned and
+  # the creep absorbed into an offset — releasing therefore produces no jump.
+  #
+  # Measured on this rig over 20 s with the camera untouched:
+  #     max excursion   27.89 mm  ->  0.70 mm      (97.5 % reduction)
+  #     integrated path 60.76 mm  ->  0.72 mm
+  # and real movement was 100 % preserved when replayed against recorded motion.
+  #
+  # Entering the hold needs a full quiet window; leaving it takes a single sample
+  # above the release threshold, so the start of a real move is never delayed.
+  # If the hold engages while you are making very slow creeping moves, lower
+  # hold_gyro_still_rad_s. If it never engages, raise it (stationary gyro noise
+  # on this camera peaked at 0.023 rad/s).
+  hold_enabled: true
+  hold_gyro_still_rad_s: 0.05
+  hold_gyro_release_rad_s: 0.08
+  hold_accel_still_std: 0.15
+  hold_window_samples: 60          # 0.3 s at 200 Hz
+
+  # Vision's veto over the IMU, and the reason a dolly move used to be eaten.
+  # The gyro cannot see a pure translation and an accelerometer cannot tell
+  # constant velocity from rest, so on a straight tracking shot the IMU reports
+  # "still" and the hold pins the position — rotation stayed perfect while
+  # translation was silently absorbed. Vision sees that motion fine, so if the
+  # raw VO estimate travels this far over the window, the hold releases.
+  #
+  # 3 mm over ~0.13 s is 22 mm/s: far above the 0.7-1.4 mm/s creep this hold
+  # exists to remove, far below any real camera move. Raise it if slow creeping
+  # moves still get pinned; lower it if stationary drift leaks through.
+  hold_vo_release_m: 0.003
+  hold_vo_window_samples: 12       # ~0.13 s at 90 Hz
+
+aruco:
+  enabled: true
+  dictionaries:
+    - "DICT_4X4_50"
+  marker_size_m: 0.10
+  lineup_marker_id: -1           # or select the specific ID in the dashboard
+
+lidar:
+  # ═════════════════════════════════════════════════════════════════════════
+  #  Absolute localisation against the LiDAR scan.
+  #
+  #  cuVSLAM is smooth but drifts and starts at an arbitrary origin. The scan
+  #  is the real world and does not drift. This fuses them: the D455 depth
+  #  stream is matched against the scan a few times a second, and the result
+  #  is used to estimate the SLAM-to-scan transform -- i.e. the accumulated
+  #  drift, as a rigid transform, corrected in position AND rotation.
+  #
+  #  All the fast camera motion still comes from VIO at 90 Hz. Only the slow
+  #  drift term is fused, which is why this adds no latency to the movement.
+  #
+  #  Two ways to start:
+  #    * ArUco     — put Locator at the flat marker centre and heading,
+  #                  then arm Line up from marker for automatic scan matching.
+  #    * Locator   — no marker needed. Drag the locator in the 3D view to
+  #                  where the camera physically is, press LOCK TO SCAN, and
+  #                  ICP snaps that guess onto the real geometry.
+  #
+  #  Supported map formats: .ply, .pcd, .obj, .stl, .fbx, .gltf, .glb
+  # ═════════════════════════════════════════════════════════════════════════
+  enabled: true
+  # Empty: nothing is preloaded, and the dashboard starts with an empty scene.
+  # Import a scan at runtime with File > Import -- the fusion picks up whatever
+  # is imported. Set an absolute path here only to have one loaded on startup.
+  map_file: ""
+  voxel_size: 0.05               # downsampling size (metres)
+  icp_rate_hz: 5.0               # how often to run continuous ICP
+
+  # ── What a fix has to look like to be believed ───────────────────────────
+  min_fitness: 0.3               # fraction of points that must find a match
+  min_inlier_points: 50
+  max_rmse_m: 0.08               # a fit sloppier than this is not trusted
+  # Reject a fix claiming the camera is further off than this. NOT the ICP
+  # search radius -- those are coarse_radius_m/fine_radius_m below. The old
+  # build used one number for both, which meant an error larger than the
+  # rejection threshold could never be seen in the first place.
+  max_correction_m: 0.30
+  max_correction_deg: 5.0
+
+  # ── ICP search radii, coarse then fine ───────────────────────────────────
+  # Wide enough to find a large error, then narrow enough to be precise. One
+  # radius cannot do both jobs.
+  #
+  # Was 1.00. Measured on the D455 against Room01_Scaled_UE01 (a 3.1 x 2.9 m
+  # room), over sets of live frames with an independent global registration as
+  # the reference:
+  #
+  #   radius   solved   worst error
+  #   1.00     2/4      450 mm
+  #   0.60     3/4       22 mm
+  #   0.30     4/4      382 mm   <- accepts more, but some are badly wrong
+  #   0.15     0-1/4      4 mm   <- almost never converges
+  #
+  # A metre-wide correspondence search spans most of a room this size, so the
+  # coarse stage slides a good hint onto the wrong geometry. 0.60 keeps enough
+  # capture range to converge while staying inside the room's own structure.
+  coarsest_radius_m: 0.60
+  coarse_radius_m: 0.50
+  fine_radius_m: 0.10
+  initial_icp_iterations: 200    # the one-shot lock-on; can afford to be slow
+  continuous_icp_iterations: 30  # every tick after that
+
+  # ── How fast a correction is allowed to arrive ───────────────────────────
+  # blend_alpha is the fraction of the measured error absorbed per fix. The
+  # slew limits then cap what the operator can actually see, in metres and
+  # degrees per second, so even a large correction arrives as a slow crawl
+  # rather than a visible slide. At the defaults a 100 mm drift takes ~5 s to
+  # come out, well under a millimetre per frame.
+  blend_alpha: 0.1
+  max_slew_m_s: 0.02
+  max_slew_deg_s: 1.0
+  # Suspend correction entirely while the stationary hold says the rig is
+  # parked. Off by default: the slew limit already keeps the motion invisible,
+  # and freezing means a locked-off camera never converges. Turn it on if you
+  # want a locked-off shot absolutely pinned, and accept that it will hold
+  # whatever error it had when it stopped moving.
+  freeze_when_stationary: false
+
+  # ── D455 depth conditioning ──────────────────────────────────────────────
+  # Stereo range error grows as z^2: with the D455's 95 mm baseline a point at
+  # 6 m is ~40x noisier than one at 1 m. Points past max_range_m are dropped
+  # and the rest are thinned in proportion to 1/sigma^2, so point density
+  # tracks how much each sample is actually worth and the noisy far field
+  # cannot outvote the near field.
+  min_range_m: 0.3               # the D455's blind zone
+  max_range_m: 6.0               # past here stereo noise swamps the signal
+  weight_ref_range_m: 2.0        # kept at full density
+  min_keep_fraction: 0.05
+  target_points: 8000            # cloud size handed to ICP each tick
+  baseline_m: 0.095              # D455 stereo baseline
+  disparity_sigma_px: 0.1
+  mesh_sample_points: 400000     # points sampled off a mesh map
+
+  # Metres per unit in the map file. A scan exported from Unreal is in
+  # CENTIMETRES and needs 0.01 here -- with it left at 1.0 the fusion is
+  # matching a metre-scale depth cloud against a centimetre-scale map and can
+  # never converge. The dashboard prints the scan's size in metres when it
+  # loads, and warns if that looks wrong; the viewport's mesh-alignment "S"
+  # slider overrides this once the operator touches it.
+  #
+  # Measured for the Room01_Scaled_UE.obj this config points at: its bounds are
+  # +/-154 x 229 x +/-147, i.e. centimetres. At 0.01 it loads as 3.1 x 2.3 x
+  # 2.9 m, which is what the [LiDAR] Map ready line should confirm on startup.
+  map_scale: 0.01
+
+  # ── Camera-image lineup against the scan ─────────────────────────────────
+  # The automatic equivalent of a 3DEqualizer lineup: project the scan from the
+  # current pose, find its silhouettes, and measure how far they sit from the
+  # real edges in the live IR picture. Shown in the dashboard as
+  # "Image lineup: N% of the scan's edges on the picture".
+  #
+  # READ-ONLY by default. image_align_refine lets it move the pose, and is off
+  # because it is not yet trustworthy enough to: measured against this scan,
+  # the objective's minimum sits 30-60 mm away from the true camera pose, while
+  # depth-vs-scan ICP is already solving to ~3 mm. It would make the answer
+  # worse. Turn it on only after checking the overlay against real footage on
+  # your own set -- and see VERSION.md for what that measurement was.
+  #
+  # Creases (normal discontinuities) are off: on a photogrammetry mesh the
+  # surface is locally noisy, so shading edges fire across whole surfaces --
+  # 4000 model edges against the image's 3311, most of them meaningless.
+  # Silhouettes alone gave 676, and behaved far better.
+  image_align_enabled: true
+  image_align_refine: false
+  image_align_use_creases: false
+  image_align_width: 320          # working resolution; a lineup costs ~50-100 ms
+  image_align_inlier_px: 3.0      # a projected edge this close counts as lined up
+  image_align_search_px: 24.0     # beyond this there is no plausible match
+  image_align_min_score: 0.35
+  image_align_max_move_m: 0.25    # a refinement should never move further
+  image_align_max_move_deg: 10.0
+
+  # An axis whose normal-covariance eigenvalue falls below this is treated as
+  # unconstrained and left uncorrected. Pointed at one flat wall ICP is free
+  # to slide along it; this is what stops it doing so. The dashboard reports
+  # "Axes constrained: n/3" so you can see when the view is too featureless.
+  observability_eps: 0.04
+
+  # ── The locator (and a marker) is a HINT, not the answer ─────────────────
+  # Pressing MATCH VIEW TO SCAN, or anchoring a marker, says only "the camera
+  # is somewhere around here". The pose itself is solved by registering what
+  # the camera sees against the scan. These control that solve.
+  #
+  # verify_threshold_m / min_verify_score are the accept test, and they are
+  # deliberately NOT ICP's own fitness: at a wide search radius fitness reads
+  # near 1.0 almost wherever you put the cloud (measured on this scan, a
+  # solution 530 mm out of place still scored 0.75). This asks the honest
+  # question instead — with the solution applied, how much of the depth image
+  # actually lands on the scanned surface? The dashboard shows it as "On scan".
+  verify_threshold_m: 0.10
+  # Require 75% depth agreement instead of 95% so incomplete/noisy scans can
+  # match. This is surface agreement, not a camera accuracy percentage.
+  # Search bounds, geometry, RMSE and correction limits still apply.
+  min_verify_score: 0.75
+
+  # Heading is what an operator placing a gizmo by hand gets most wrong, and
+  # what ICP is least able to recover on its own, so the lock-on tries this
+  # many yaw offsets spread over +/- seed_yaw_search_deg around the hint and
+  # keeps whichever verifies best. Set steps to 1 to disable the search.
+  # ── Where in the scan to search ──────────────────────────────────────────
+  # The locator says "the camera is somewhere around here". These bound how
+  # far from it the answer is allowed to be: a match outside the region is a
+  # different part of the room that happened to look similar, not a refinement
+  # of your hint, and is refused with a message saying so.
+  #
+  # This matters more than it sounds. Gated loosely (2 m / 45°), a close-up of
+  # a table corner in a cluttered room locked onto geometry 1.1 m and 42° away,
+  # reported success, and left continuous fusion permanently asking for a
+  # 409 mm correction the runtime gate would not let it make.
+  #
+  # Widen if you cannot place the locator accurately; narrow if the fusion is
+  # finding lookalike geometry nearby.
+  hint_radius_m: 0.50
+  hint_radius_deg: 20.0
+
+  seed_yaw_search_deg: 25.0
+  seed_yaw_steps: 5
+
+  # The yaw candidates are screened cheaply on the coarse pyramid, then a
+  # shortlist is refined at full resolution and the best kept. Refining only
+  # the single leader measurably lost good solutions -- a coarse screen ranks
+  # candidates only approximately. A hint that already lands within
+  # early_exit_median_m of the scan skips the search entirely, so a good hint
+  # costs ~0.2 s and a poor one ~0.8 s.
+  refine_candidates: 3
+  shortlist_ratio: 1.5
+
+  # Candidates are ranked on how much of the view lands on the scan, PLUS how
+  # far they are from your hint -- likelihood plus prior. In a cluttered room
+  # several placements match about equally well and the hint breaks the tie.
+  # In score units per metre: 0.10 means a candidate half a metre from your
+  # hint has to match 5% better to win. Raise it to trust your locator more,
+  # lower it to trust the geometry more.
+  hint_weight: 0.10
+  early_exit_median_m: 0.05
+
+# Motion is streamed only after lineup and repeated supporting measurements.
+fusion:
+  enabled: true
+  require_lineup: true
+  scan_timeout_s: 0.8
+  gnss_timeout_s: 0.8
+  # After lineup, keep following fresh stereo/IMU motion when scan checks
+  # fail or arrive late. The status stays amber until scan validation recovers.
+  allow_vio_fallback: true
+  single_source_grace_s: 1.0      # applies only with allow_vio_fallback: false
+  recovery_samples: 3
+  min_scan_rank: 3
+  depth_pose_tolerance_s: 0.035
+  depth_timeout_s: 0.5
+  recovery_max_distance_m: 0.10
+  recovery_max_angle_deg: 5.0
+  recovery_slew_m_s: 0.10
+  recovery_slew_deg_s: 5.0
+
+gnss:
+  # Studio work: leave this off. It exists for outdoor large-volume shoots.
+  enabled: false
+  port: "/dev/ttyACM0"
+  baud: 115200
+  # Keep false until the outdoor setup in RTK_SETUP.md is complete.
+  calibrated: false
+  origin_lla: null               # surveyed latitude, longitude, ellipsoid height
+  origin_world_m: [0.0, 0.0, 0.0] # that surveyed point in displayed ROS world
+  enu_yaw_deg: 0.0               # rotation taking ENU into displayed ROS world
+  antenna_offset_body_m: [0.0, 0.0, 0.0] # D455 -> antenna: forward, left, up
+  latency_s: 0.0                 # measure receiver + serial latency
+  pose_tolerance_s: 0.05
+  min_satellites: 8
+  max_hdop: 2.0
+  max_correction_age_s: 2.0
+  max_hacc_m: 0.05
+  max_vacc_m: 0.10
+  max_innovation_m: 0.20
+
+timecode:
+  # LTC decoded from the audio input, shown on the dashboard for slating.
+  enabled: true
+
+ui:
+  refresh_hz: 60
+  trajectory_points: 3000

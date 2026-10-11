@@ -44,6 +44,12 @@ class FusionSupervisor:
                 state = "VALIDATED" if "scan" in supported else "RTK_ASSISTED"
                 reason = ("Stereo / IMU with depth-to-scan validation" if "scan" in supported
                           else "Stereo / IMU with RTK position check; rotation is camera-only")
+            elif aligned and self.cfg.get("allow_vio_fallback", True):
+                # The scan estimates the world alignment; VIO supplies live
+                # motion. A partial/noisy scan must not pin a fresh camera at
+                # its lineup pose, including while the first checks accumulate.
+                state = "DEGRADED"
+                reason = "Stereo / IMU camera tracking active; scan validation unavailable or recovering"
             elif self.last_supported is None:
                 state, reason = "VERIFYING", "Waiting for consecutive scan or calibrated RTK checks"
             elif now - self.last_supported <= max(0.0, self.cfg.get("single_source_grace_s", 1.0)):

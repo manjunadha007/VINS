@@ -222,16 +222,14 @@ class HeadlessBridge:
         self._accept_pose(
             (p.x, p.y, p.z), (o.x, o.y, o.z, o.w),
             (lin.x, lin.y, lin.z), (ang.x, ang.y, ang.z),
-            stamp=self._stamp_seconds(msg))
+            stamp=self._stamp_seconds(msg), source="odometry")
 
     def vo_pose_callback(self, msg):
-        if self.last_vio_time and (time.time() - self.last_vio_time) < 1.0:
-            return
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
         self._accept_pose((p.x, p.y, p.z), (o.x, o.y, o.z, o.w),
                           (0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
-                          stamp=self._stamp_seconds(msg))
+                          stamp=self._stamp_seconds(msg), source="vo")
 
     # ── Delegating views onto the engine ─────────────────────────────
     @property
@@ -364,7 +362,7 @@ class HeadlessBridge:
             return None
         return s.sec + s.nanosec * 1e-9
 
-    def _accept_pose(self, position, quaternion, linear, angular, stamp=None):
+    def _accept_pose(self, position, quaternion, linear, angular, stamp=None, *, source=None):
         """Hand a raw SLAM pose to the engine.
 
         Deliberately raw. The map correction used to be blended into `position`
@@ -374,7 +372,8 @@ class HeadlessBridge:
         this stays a clean VIO stream and the gate keeps seeing only genuine
         tracker behaviour.
         """
-        self.engine.accept_pose(position, quaternion, linear, angular, stamp)
+        if not self.engine.accept_pose(position, quaternion, linear, angular, stamp, source=source):
+            return
 
         if self.send_on_pose:
             self._stream_freed()

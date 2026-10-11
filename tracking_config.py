@@ -176,7 +176,7 @@ DEFAULTS = {
 
         # ── verifying a lock-on (the locator/marker is only a hint) ──────────
         "verify_threshold_m": 0.10,      # a depth point this close counts as "on the scan"
-        "min_verify_score": 0.55,        # fraction of the view that must land on it
+        "min_verify_score": 0.75,        # tolerate incomplete/noisy scan coverage
         # The hint defines WHERE IN THE SCAN to search. A match outside this
         # region is a different place that happened to look similar, not a
         # refinement of the hint, and is rejected.
@@ -243,7 +243,8 @@ DEFAULTS = {
         "require_lineup": True,
         "scan_timeout_s": 0.8,
         "gnss_timeout_s": 0.8,
-        "single_source_grace_s": 1.0,
+        "allow_vio_fallback": True,     # fresh aligned camera motion continues without scan support
+        "single_source_grace_s": 1.0,   # used only when allow_vio_fallback is false
         "recovery_samples": 3,
         "min_scan_rank": 3,
         "depth_pose_tolerance_s": 0.035,

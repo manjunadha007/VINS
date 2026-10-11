@@ -221,10 +221,17 @@ class TestSinglePoseWriter(VirtualCameraTestCase):
     """Only one topic may drive the output stream at a time."""
 
     def test_vo_pose_works_before_odometry_arrives(self):
+        from unittest.mock import patch
         gui = self._make_gui()
-        gui.vo_pose_callback(self._vo_pose(1.0, 0.0, 0.0))
-        self.assertIsNotNone(gui.latest_unreal)
-        self.assertAlmostEqual(gui.latest_unreal.x, 1.0, places=6)
+        with patch("time.monotonic", return_value=100.) as mono, \
+                patch("time.time", return_value=1000.) as wall:
+            for i in range(90):
+                mono.return_value = 100. + i / 90.
+                wall.return_value = 1000. + i / 90.
+                gui.vo_pose_callback(self._vo_pose(i * .01, 0.0, 0.0))
+                self.assertIsNotNone(gui.latest_unreal)
+                self.assertAlmostEqual(gui.latest_unreal.x, i * .01, places=6)
+        self.assertEqual(gui.engine.pose_updates, 90)
 
     def test_vo_pose_yields_once_odometry_is_live(self):
         """Both topics carry the same result; two writers would fight."""
@@ -647,7 +654,7 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
         with patch("time.monotonic", return_value=100.) as mono:
             gui, obs, truth = self._marker_gui()
             self._install_verified_marker(gui, obs, truth)
-            self.assertEqual(gui.btn_marker_lineup.property("lineupState"), "verifying")
+            self.assertEqual(gui.btn_marker_lineup.property("lineupState"), "tracking")
             # Re-reading the same successful measurement cannot manufacture readiness.
             for _ in range(5):
                 gui.engine.observe_scan(gui.lidar_matcher.last_measurement)
@@ -672,7 +679,8 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
             mono.return_value = 102.
             gui.engine._last_pose_mono = 102.
             gui._refresh_marker_indicator()
-            self.assertNotEqual(gui.btn_marker_lineup.property("lineupState"), "locked")
+            self.assertEqual(gui.btn_marker_lineup.property("lineupState"), "tracking")
+            self.assertIn("camera tracking active", gui.lbl_marker_lineup.text())
             # RTK alone does not claim a scan lock.
             for t in (101.94, 101.97, 102.):
                 gui.engine.fusion.observe("gnss", True, t)
@@ -725,7 +733,7 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
             self._install_verified_marker(gui, obs, truth)
             gui._marker_detection_sample = None  # no more marker needed
             previous = None
-            for i in range(1, 8):
+            for i in range(1, 81):
                 mono.return_value = 100. + i * .04
                 wall.return_value = 1000. + i * .04
                 moved = np.eye(4)
@@ -734,9 +742,10 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
                 raw = obs.T_slam_depth @ moved
                 gui.engine.accept_pose(raw[:3, 3], matrix_to_quaternion(raw[:3, :3]),
                                        [0, 0, 0], [0, 0, 0], stamp=11. + i * .04)
-                self._fresh_scan(gui, mono.return_value)
-                if i < 2:
-                    continue  # recovery requires three distinct scan observations
+                if i <= 3:
+                    self._fresh_scan(gui, mono.return_value)
+                # Continue moving for seconds after scan evidence expires.
+                # Camera motion starts on the very first post-lineup frame.
                 # An obsolete manual preview must not take ownership of the live dot.
                 gui._lineup = SimpleNamespace(T_map_cam=np.eye(4))
                 gui._refresh_tracked_camera()
@@ -753,6 +762,9 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
                 if previous is not None:
                     self.assertGreater(np.linalg.norm(expected[:3, 3] - previous[:3, 3]), .05)
                 previous = expected.copy()
+            gui._refresh_marker_indicator()
+            self.assertEqual(gui.btn_marker_lineup.property("lineupState"), "tracking")
+            self.assertFalse(gui.engine._relineup_required)
             mono.return_value += 1.
             wall.return_value += 1.
             gui._refresh_tracked_camera()

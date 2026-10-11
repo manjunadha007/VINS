@@ -269,7 +269,7 @@ class LidarMapMatcher:
         # fraction of depth points landing within `verify_threshold_m` of the
         # scan once the solution is applied.
         self.verify_threshold_m = float(cfg.get("verify_threshold_m", 0.10))
-        self.min_verify_score = float(cfg.get("min_verify_score", 0.55))
+        self.min_verify_score = float(cfg.get("min_verify_score", 0.75))
 
         # Yaw is the DOF an operator gets most wrong when placing a hint by
         # hand (the locator's heading ring), and it is also the one ICP is
