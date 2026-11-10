@@ -387,13 +387,16 @@ class TrackingEngine:
     def observe_scan(self, measurement):
         if measurement is None or measurement.monotonic_timestamp is None:
             return
-        ok = measurement.ok and measurement.observable_rank >= self.cfg.get("fusion", {}).get("min_scan_rank", 3)
+        marker_keys = getattr(measurement, "marker_keys", ())
+        ok = measurement.ok and (measurement.observable_rank >= self.cfg.get("fusion", {}).get("min_scan_rank", 3)
+                                  or len(marker_keys) >= 2)
         reason = measurement.reason
         if measurement.ok and not ok:
             reason = "Scan geometry does not constrain all required translation axes"
-        self.fusion.observe("scan", ok, measurement.monotonic_timestamp, reason,
+        self.fusion.observe("markers" if marker_keys else "scan", ok, measurement.monotonic_timestamp, reason,
                             score=float(measurement.verify_score),
                             rank=int(measurement.observable_rank),
+                            marker_count=len(marker_keys),
                             rmse_mm=float(measurement.rmse_m * 1000))
 
     def confirm_lineup(self):

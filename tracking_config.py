@@ -45,7 +45,7 @@ def aruco_dictionary_names(aruco_config):
     """
     names = aruco_config.get("dictionaries")
     if names is None:
-        names = aruco_config.get("dictionary", "DICT_4X4_1000")
+        names = aruco_config.get("dictionary", "DICT_4X4_250")
     if isinstance(names, str):
         names = [names]
 
@@ -70,6 +70,7 @@ DEFAULTS = {
         "vo_pose": "/visual_slam/tracking/vo_pose_covariance",
         "status": "/visual_slam/status",
         "image": "/camera/infra1/image_rect_raw",
+        "depth_preview": "/camera/depth_preview/image_rect_raw",
         "camera_info": "/camera/infra1/camera_info",
         "imu": "/camera/imu",
         "depth": "/camera/depth/image_rect_raw",
@@ -137,9 +138,20 @@ DEFAULTS = {
     # ── ArUco ground-zero anchoring ───────────────────────────────────────────
     "aruco": {
         "enabled": True,
-        "dictionary": "DICT_4X4_1000",
+        "dictionary": "DICT_4X4_250",
         "marker_size_m": 0.10,
         "lineup_marker_id": -1,    # -1 requires exactly one visible marker
+        "marker_support_rate_hz": 2.0,
+        "marker_max_reprojection_px": 3.0,
+        # Auto lineup looks for the marker this far from the Locator.
+        "lineup_search_radius_m": 1.0,
+        "lineup_search_step_m": 0.15,
+        # After lineup, place every other detected marker from the locked camera.
+        "auto_place_markers": True,
+        "auto_place_min_sightings": 6,
+        "auto_place_tolerance_m": 0.03,
+        "auto_place_tolerance_deg": 6.0,
+        "auto_place_min_marker_px": 24,
         # Depth cross-check on the marker solve. Four coplanar corners are
         # pose-ambiguous, so a mono PnP can silently settle on the mirrored
         # solution — and a flipped anchor takes the whole virtual set with it.
@@ -242,6 +254,7 @@ DEFAULTS = {
         "enabled": False,
         "require_lineup": True,
         "scan_timeout_s": 0.8,
+        "markers_timeout_s": 1.2,
         "gnss_timeout_s": 0.8,
         "allow_vio_fallback": True,     # fresh aligned camera motion continues without scan support
         "single_source_grace_s": 1.0,   # used only when allow_vio_fallback is false
@@ -282,9 +295,17 @@ DEFAULTS = {
         "enabled": True,
         "samplerate": 48000,
     },
+    # GoPro preview beside the 3D view. Display only: never tracking or FreeD.
+    "gopro": {
+        "auto_start": True,
+        "host": "auto",          # found from the USB link, or the camera's IP
+        "resolution": "720",     # 720 | 1080
+        "fov": "linear",         # wide | narrow | linear
+    },
     "ui": {
         "refresh_hz": 60,
         "trajectory_points": 3000,
+        "hold_maximize_as_normal": True,   # Xwayland freezes maximized windows here
     },
 }
 

@@ -84,6 +84,13 @@ class TestArucoConfiguration(unittest.TestCase):
         self.assertEqual(tracking_config.aruco_dictionary_names(cfg),
                          tracking_config.ARUCO_4X4_FAMILIES)
 
+    def test_printed_4x4_250_set_is_the_default_and_configured_family(self):
+        from pathlib import Path
+        self.assertEqual(tracking_config.aruco_dictionary_names({}), ("DICT_4X4_250",))
+        cfg = tracking_config.load_config(
+            str(Path(tracking_config.__file__).with_name("tracking.yaml")), verbose=False)
+        self.assertEqual(tracking_config.aruco_dictionary_names(cfg["aruco"]), ("DICT_4X4_250",))
+
     def test_legacy_singular_form_remains_supported(self):
         self.assertEqual(tracking_config.aruco_dictionary_names(
             {"dictionary": "DICT_4X4_250"}), ("DICT_4X4_250",))

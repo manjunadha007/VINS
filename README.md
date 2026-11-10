@@ -1,10 +1,26 @@
 # Virtual Production Camera Tracking
 
 
-The dashboard uses one **Operate → Auto lineup** checkbox for the flat
-**DICT_4X4_50, 10 cm ArUco marker**. Place the locator at the physical marker's
-centre, set its heading, and enable the checkbox. It turns green only when the
-camera is locked with fresh scan fusion. Marker settings and detailed diagnostics
+The dashboard uses one **Operate → Auto lineup** checkbox for ArUco-assisted
+scan alignment. For multiple markers, select **Locator → Duplicate Locator**
+in the viewport, place each Locator at its physical marker, then choose its
+detected ID, enter its printed width and click **Assign ID**. Only the placed
+centres need to be accurate. Auto lineup measures the locator orientations from
+the marker corners and surrounding RealSense depth: +X toward the printed top
+and +Z out of its face. Unclear orientations wait for a better view. Visible assigned markers are
+solved together and continue to support tracking with gradual corrections.
+**Setup → Save / Load marker layout** preserves these assignments.
+With three assigned Locators, **Auto lineup** first measures the scan's uniform
+scale from their triangle and RealSense depth (12 seconds). Keep the markers and
+surrounding scanned surfaces in view. It verifies the proposed scale against the
+depth cloud, scales every Locator with the scan, then runs the rigid lineup.
+Hand-placed positions stay attached to their original scan locations; printed
+marker widths remain in metres. **File → Save** keeps the calibrated scene.
+The existing single unassigned Locator also works with a flat
+**DICT_4X4_250, 10 cm marker**; Auto lineup looks for it in the scan up to 1 m
+from the Locator. Enable Auto lineup; it turns green only when the camera is
+locked with fresh scan fusion. Once it is green, every other marker in view is
+placed in the scan automatically and joins the joint solve. Marker settings and detailed diagnostics
 are in **Setup**. Follow [LINEUP_LITE.md](LINEUP_LITE.md) for placement, indicator
 states and recovery. The 3D camera and FreeD follow the same supervised pose.
 After an accepted lineup, fresh stereo/IMU motion continues even when scan
@@ -106,7 +122,7 @@ cd /workspaces/isaac_ros-dev && colcon build --symlink-install --packages-select
 container workspace on every launch, so the repo is the single source of truth.
 `tracking.yaml` is installed once and then left alone, so on-set edits survive.
 
-It launches [isaac_vp.launch.py](isaac_vp.launch.py) by default: visual-inertial odometry without loop closure at 848x480x90 with auto-exposure capped declaratively. Set
+It launches [isaac_vp.launch.py](isaac_vp.launch.py) by default: visual-inertial odometry without loop closure, with exposure capped and 848x480x90 capture. With depth enabled, alternating projection supplies about 45 Hz to tracking and 45 Hz to depth matching. Set
 `VP_SLAM_LAUNCH=nvidia` to fall back to NVIDIA's stock launch file.
 
 Check the pipeline at any time, without Unreal:
@@ -316,6 +332,62 @@ Origin to edit their transforms as described in the Channel Box section above.
 A stored scan alignment stays locked. The gizmo toggle controls handle visibility
 and picking.
 
+The camera workspace has two views side by side. **Live camera / Scan overlay**
+keeps the tracking image and optional scan edges. **Depth points / Auto lineup**
+shows measured depth points over the IR image from the same exposure (red near,
+blue far). It is visible by default; **Setup → Show depth preview beside camera**
+hides or restores it. Missing or stale paired frames clear the preview.
+
+Below them, **GoPro / Camera view** sits beside the 3D **Scene alignment**
+view; drag the divider to resize either. It previews a GoPro HERO10 connected
+by USB, found automatically from its USB network link (camera at
+`172.2X.1YZ.51`). It starts the camera's webcam mode at 720p with the linear lens,
+about 30 fps, and leaves webcam mode on **Stop GoPro** or when the dashboard
+closes. It is display only: nothing from it reaches tracking or FreeD. The
+`gopro:` section of `tracking.yaml` sets `auto_start`, `host`, `resolution`
+(720/1080) and `fov` (wide/narrow/linear). A GoPro that shows "charging only" and
+no USB activity needs a data cable, the hub powered first, and a battery
+pull. The TOP (XY) and FRONT (XZ) views are gone.
+
+The coverage percentage counts usable depth in the configured range (default
+0.3–6 m). Geometry reports how many position axes the visible surfaces constrain.
+Aim for broad coverage and **3/3 axes**: floor plus one wall provides only 2/3.
+Include another wall, a corner or furniture. These are depth measurements, not
+SLAM feature counts; even a green candidate view still needs agreement with the
+loaded scan. All existing lineup verification remains enabled.
+
+With depth enabled, the VP launch now defaults to hardware projector alternation
+at 848×480×90: approximately **45 Hz emitter-off stereo for Isaac** and **45 Hz
+emitter-on depth for scan matching**. A bounded exact-timestamp splitter checks
+the emitter metadata for both IR images and depth before forwarding an exposure.
+Missing or inconsistent metadata is rejected, never guessed from frame parity.
+The right preview receives the emitter-on IR image paired with its depth; the
+left image remains free of projected dots. The camera's raw streams are under
+`/camera/raw`; existing consumers keep their original topics.
+
+Use **IR PROJECTOR: ON/OFF** in the top bar beside the session status to switch projection on or off
+without restarting the camera. The switch reads back the camera setting and
+shows **APPLYING…** while a change is pending; unavailable controls and rejected
+changes are reported below it. With projection off, passive stereo depth and
+its synchronized preview continue. Switching on restores alternating projection
+when the splitter is running. Stock/passive launches use continuous projection.
+The choice lasts until the camera pipeline restarts. To start with projection
+off, run `VP_EMITTER_MODE=off ./launch_isaac.sh`. Depth coverage may be lower on
+plain surfaces without the projected pattern.
+
+```bash
+./launch_isaac.sh                         # 90 FPS capture, approximately 45+45
+VP_CAMERA_FPS=60 ./launch_isaac.sh         # 30+30 alternative
+VP_EMITTER_MODE=off ./launch_isaac.sh      # passive 90 FPS tracking
+```
+
+These controls apply to the VP launch, not the NVIDIA stock fallback. A failed
+splitter/metadata check stops startup instead of passing projected dots to SLAM.
+The log prints the measured rates. Passive mode also supports the paired depth
+preview. Alternation improves available depth texture but halves visual update
+frequency; position accuracy and fast-motion performance must be measured on
+the set.
+
 The older survey-point and manual image-alignment solvers remain in the source
 for development; their controls are no longer shown in the dashboard.
 
@@ -425,7 +497,8 @@ bridge (sub-millisecond), UDP, and Unreal's own render pipeline.
 
 To reduce it:
 
-* SLAM runs at 90 fps. [isaac_vp.launch.py](isaac_vp.launch.py) configures
+* Capture runs at 90 fps (45 fps to SLAM with alternating projection).
+  [isaac_vp.launch.py](isaac_vp.launch.py) configures
   848x480x90; the earlier claim that this D455 could not resolve 848x480 as a
   stereo pair was a USB 2 negotiation, not a device limit. Over USB 3.2 the unit
   offers IR1, IR2 and depth all at 848x480 up to 90 Hz. If the profile list ever
@@ -451,6 +524,7 @@ not.
 | Nothing moves in Unreal | Camera ID mismatch, wrong `unreal_ip`, or UDP 11111 blocked. Run `calibrate_axes.py` to isolate — if that moves the camera, the problem is upstream in SLAM. |
 | Virtual camera moves the wrong way on one axis | Axis sign. See calibration above. |
 | Dashboard stops responding when **maximized** | Restart through `./launch_isaac.sh` to load the current renderer. The viewport now uses Qt’s managed `paintGL()` framebuffer lifecycle, retains swap interval 0, and avoids repeated status-style layout invalidation. Regression checks cover framebuffer resizing and native window-manager replies in the Isaac container; see `VERSION.md` for results. |
+| Entire dashboard window goes blank while camera streams continue | `launch_isaac.sh` now selects Qt's `xcb_egl` display backend to avoid the NVIDIA GLX/Xwayland presentation failure observed on this rig. EGL may use Mesa software rendering for the dashboard; Isaac's CUDA tracking is unaffected. Override with `QT_XCB_GL_INTEGRATION=xcb_glx ./launch_isaac.sh` if needed on another display setup. Dashboard output is saved to `/tmp/hyperfusion-dashboard.log` inside the container. |
 | Dashboard goes unresponsive, worse the larger the window | Fixed in 1.3. The 3D viewport projected one line segment per Python call, so the 2000-point camera trail and the ground grid cost 35 ms a paint against a 16.7 ms budget and the GUI thread never caught up. If it recurs, check the paint cost before blaming the GPU — the mesh is drawn by OpenGL and is not usually the expensive part. |
 | Virtual camera banks when you pan | The pre-fix symptom of the gimbal-lock bug. Confirm `pose_transform.py` is deployed and you are not running a stale `dashboard_isaac.py`. |
 | Position drifts with the camera stationary | The stationary hold should pin this to ~1 mm; check `tracking.hold_enabled` and that the dashboard shows `HOLD (still)`. If the hold is engaging but drift persists while moving, the cause is scene content — see the row below. |

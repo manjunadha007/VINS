@@ -66,7 +66,7 @@ class FakeViewer:
         self.T_align[:3, :3] = so3_exp(np.radians([0, 0, 20.0])) * SCALE
         self.T_align[:3, 3] = [1.0, -0.5, 0.2]
         self._loc = np.eye(4)
-    def get_locator_transform(self):
+    def get_locator_transform(self, locator_id=None):
         return self._loc.copy()
 gui.map_viewer = FakeViewer()
 SCALE_A, RIGID_A = decompose_similarity(gui.map_viewer.T_align)
@@ -163,19 +163,38 @@ lo, hi = verts.min(axis=0), verts.max(axis=0)
 centre = (lo + hi) / 2
 T_map_markerCV = np.eye(4)                      # OpenCV marker axes: right/up/out
 T_map_markerCV[:3, :3] = so3_exp(np.radians([0, 0, 37.0]))
-T_map_markerCV[:3, 3] = [centre[0], centre[1], lo[2] + 0.002]
 to_locator = np.eye(4); to_locator[:3, :3] = so3_exp(np.radians([0, 0, 90.0]))
-T_map_locator = T_map_markerCV @ to_locator     # +X to the printed top, +Z up
 
-# The camera looking down at it from 1.25 m.
-eye = np.array([centre[0] - 0.55, centre[1] - 0.75, lo[2] + 1.25])
-fwd = T_map_markerCV[:3, 3] - eye; fwd /= np.linalg.norm(fwd)
+def cast(origin, direction):
+    hit = scene.cast_rays(o3d.core.Tensor(np.r_[origin, direction].astype(np.float32)[None]))
+    return float(hit["t_hit"].numpy()[0]), hit["primitive_normals"].numpy()[0]
+
+# The marker must lie on a flat, +Z-facing patch the camera really sees: the
+# lineup checks its size against depth, and the scan's minimum-Z plane at the
+# centre is hidden behind furniture. Search outward from the centre for one,
+# with the camera 1.25 m above it, as before.
+for dx, dy in sorted(((x, y) for x in np.arange(-.6, .61, .1) for y in np.arange(-.6, .61, .1)),
+                     key=lambda o: np.hypot(*o)):
+    above = np.array([centre[0] + dx, centre[1] + dy, lo[2] + 1.25])
+    t_down, n_down = cast(above, np.array([0, 0, -1.0]))
+    if not np.isfinite(t_down) or n_down[2] < 0.97:
+        continue
+    marker = above - [0, 0, t_down - 0.002]
+    eye = marker + [-0.55, -0.75, 1.25]
+    fwd = marker - eye; fwd /= np.linalg.norm(fwd)
+    t_view, n_view = cast(eye, fwd)
+    if abs(t_view - np.linalg.norm(marker - eye)) < 0.01 and n_view[2] > 0.97:
+        break
+else:
+    raise SystemExit("no visible flat patch for the marker near the scan centre")
+T_map_markerCV[:3, 3] = marker
 right = np.cross(fwd, [0, 0, 1.0]); right /= np.linalg.norm(right)
 T_map_optical = np.eye(4)
 T_map_optical[:3, :3] = np.column_stack([right, np.cross(fwd, right), fwd])
 T_map_optical[:3, 3] = eye
 TRUTH2 = T_map_optical @ invert_transform(T_BODY_OPTICAL)
 T_disp_true2 = RIGID_A @ TRUTH2
+T_map_locator = T_map_markerCV @ to_locator
 
 # The operator walks the rig over. Steps stay under the pose gate's jump
 # limit, so SLAM keeps tracking and no resync cancels the lineup.
@@ -218,18 +237,27 @@ class FakeCheck(FakeBtn):
     def setProperty(self, k, v): pass
     def styleSheet(self): return ""
 class FakePersp:
+    """One Locator, which Auto lineup may give the lineup marker's ID."""
+    _active_locator_id = "locator"
+    _locators = {"locator": None}
+    marker = None
     def set_locator_marker_size(self, w): pass
     def select_locator(self): pass
+    def locator_entries(self):
+        return {"locator": dict(name="Locator", transform=gui.map_viewer._loc.copy(),
+                                marker=self.marker)}
+    def assign_marker_to_locator(self, key, family, fid, size_m):
+        self.marker = dict(dictionary=family, id=fid, size_m=size_m)
 class FakeSignal:
     """The worker thread emits here; the test runs the queued slot itself."""
     def __init__(self): self.results = []
     def emit(self, result): self.results.append(result)
 gui.map_viewer.persp_view = FakePersp()
-gui.map_viewer.set_locator_transform = lambda T: setattr(gui.map_viewer, "_loc", T.copy())
+gui.map_viewer.set_locator_transform = lambda T, locator_id=None: setattr(gui.map_viewer, "_loc", T.copy())
 gui.marker_lineup_finished = FakeSignal()
 gui.aruco_enabled = True
 gui._lineup = None
-gui.marker_family = FakeField("DICT_4X4_50")
+gui.marker_family = FakeField("DICT_4X4_250")
 gui.marker_id = FakeField(7)
 gui.marker_width = FakeField(MARKER_M)
 gui.btn_marker_lineup = FakeCheck()
@@ -238,6 +266,8 @@ gui.lbl_marker_lineup = FakeBtn()
 gui._marker_request = gui._marker_lock_context = None
 gui._marker_busy = gui._marker_shutdown = gui._marker_failed = False
 gui._marker_detection_sample = None
+from marker_map import MarkerSurvey
+gui._marker_survey = MarkerSurvey()     # after the lock, other markers would be placed
 
 gui._toggle_marker_lineup(True)
 print(f"  armed: {gui.btn_marker_lineup.t} -- {gui._marker_detail}")
@@ -250,7 +280,7 @@ h = MARKER_M / 2
 square = np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]])
 cam = (square @ T_map_markerCV[:3, :3].T + T_map_markerCV[:3, 3] - eye) @ T_map_optical[:3, :3]
 corners = (cam @ K.T)[:, :2] / cam[:, 2:3]
-gui._marker_detection_sample = ([("DICT_4X4_50", 7, corners)], s,
+gui._marker_detection_sample = ([("DICT_4X4_250", 7, corners)], s,
                                 time.monotonic(), (W, H))
 gui._poll_marker_lineup()
 print(f"  {gui._marker_detail}")
@@ -277,9 +307,15 @@ print(f"  locator was {np.linalg.norm(marker_err[:3, 3])*1000:.0f} mm off; trust
 if measurement is not None and measurement.ok:
     print(f"  scan match: {measurement.verify_score:.0%} of the view on the scan, "
           f"rank {measurement.observable_rank}")
+# The search found the marker itself, so the Locator moves onto it and keeps its ID.
+loc_off = np.linalg.norm(gui.map_viewer._loc[:3, 3] - (RIGID_A @ T_map_locator)[:3, 3])
+adopted = gui.map_viewer.persp_view.marker
+print(f"  Locator now {loc_off*1000:.0f} mm from the real marker; assigned "
+      f"{adopted and (adopted['dictionary'], adopted['id'])}")
 
 ok = (e0[0] < 0.05 and e0[1] < 1.0 and e1[0] <= e0[0] + 1e-6
       and to_hint > 0.1 and locked and e2[0] < 0.05 and e2[1] < 1.0
-      and hint_off > 0.1)
+      and hint_off > 0.1 and loc_off < 0.03
+      and adopted is not None and adopted["id"] == 7)
 print("\nRESULT:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

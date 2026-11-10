@@ -42,6 +42,7 @@ def main(argv=None):
     parser.add_argument("--config")
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--require-depth", action="store_true")
+    parser.add_argument("--require-active-depth", action="store_true")
     args = parser.parse_args(argv)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be positive and finite")
@@ -61,11 +62,13 @@ def main(argv=None):
         "IMU": (Imu, topics["imu"]),
         "SLAM odometry": (Odometry, topics["odometry"]),
     }
-    if args.require_depth or cfg["lidar"]["enabled"]:
+    if args.require_depth or args.require_active_depth or cfg["lidar"]["enabled"]:
         required.update({
             "depth": (Image, topics["depth"]),
             "depth calibration": (CameraInfo, topics["depth_camera_info"]),
         })
+    if args.require_active_depth:
+        required["active-depth preview"] = (Image, topics["depth_preview"])
     health = {name: StreamHealth() for name in required}
     rclpy.init(args=[])
     node = rclpy.create_node("hyperfusion_startup_check")

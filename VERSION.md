@@ -1,3 +1,26 @@
+# 2026-11-10 — v1.7 snapshot: multi-marker layouts, scan scale, GoPro view
+
+Frozen as `versions/v1.7/`. v1.6's pipeline with several ArUco markers solved
+together, a depth-measured scan scale, alternating IR projection with a live
+depth preview, and a GoPro preview in place of the TOP/FRONT views.
+
+Assigned markers are solved jointly and support tracking at 2 Hz. Their
+rotations are measured from the camera, and a misplaced Locator is named. After
+a single-marker lock, every other marker in view places itself. The
+single-marker search covers 1 m around the Locator at every heading, and a
+Square width that disagrees with depth by more than 10 % is refused. Three
+markers plus depth fit the scan's scale. Capture is 848×480 at 90 fps, split by
+emitter metadata into 45 Hz stereo and 45 Hz projected depth, with a live
+projector switch.
+
+Seen live on 2026-11-10: lock at 99 % scan agreement with 3/3 axes and 3 mapped
+markers, depth vs scan 99.8 % / 27 mm mean, and the GoPro at 720p and 30 fps.
+Passes 561 unit tests in the Isaac image plus the three smoke scripts. Known
+limits: one dashboard abort (`stack smashing detected`, main thread) seconds
+after the GoPro preview started, cause unknown, so `gopro.auto_start` is off in
+the deployed config; one SLAM launch segfault; the scan overlay draws nothing on
+plain walls.
+
 # 2026-10-11 — v1.6 snapshot: camera keeps moving after lineup, looser scan matching
 
 Frozen as `versions/v1.6/`. v1.5's pipeline with the camera no longer freezing

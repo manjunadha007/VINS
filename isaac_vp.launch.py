@@ -24,13 +24,15 @@
 # If this ever fails again, check the link is USB 3.x first:
 #   rs-enumerate-devices | grep -i 'usb type'
 #
-# OPT-IN — launch_isaac.sh uses NVIDIA's shipped file unless you set:
-#
-#     VP_SLAM_LAUNCH=vp ./launch_isaac.sh
+# launch_isaac.sh uses this profile by default. With depth enabled, hardware
+# emitter alternation yields 45 Hz tracking + 45 Hz active depth at 90 FPS.
+# VP_EMITTER_MODE=off restores passive stereo; VP_CAMERA_FPS=60 tests 30+30 Hz.
 
 import os
+import sys
 
 import launch
+from launch.actions import ExecuteProcess
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
 
@@ -47,6 +49,13 @@ from launch_ros.descriptions import ComposableNode
 # every pixel on the CPU.
 _ENABLE_DEPTH = os.environ.get('VP_ENABLE_DEPTH', '0').lower() not in (
     '0', '', 'false', 'no')
+_EMITTER_MODE = os.environ.get('VP_EMITTER_MODE', 'alternating').lower()
+_CAMERA_FPS = int(os.environ.get('VP_CAMERA_FPS', '90'))
+if _EMITTER_MODE not in ('alternating', 'off'):
+    raise ValueError('VP_EMITTER_MODE must be alternating or off')
+if _CAMERA_FPS not in (30, 60, 90):
+    raise ValueError('VP_CAMERA_FPS must be 30, 60 or 90 at 848x480')
+_ALTERNATING = _ENABLE_DEPTH and _EMITTER_MODE == 'alternating'
 
 
 def generate_launch_description():
@@ -72,10 +81,11 @@ def generate_launch_description():
             # for free and needs no resampling.
             'align_depth.enable': False,
             'pointcloud.enable': False,
-            # The IR projector must stay off: its dot pattern is a static
-            # texture locked to the camera, which corrupts feature tracking.
-            'depth_module.emitter_enabled': 0,
-            'depth_module.profile': '848x480x90',
+            # Hardware alternates per exposure. The metadata splitter keeps
+            # projected texture out of visual tracking.
+            'depth_module.emitter_enabled': 1 if _ALTERNATING else 0,
+            'depth_module.emitter_on_off': _ALTERNATING,
+            'depth_module.profile': f'848x480x{_CAMERA_FPS}',
 
             # Cap auto-exposure. THE most important accuracy setting measured on
             # this rig. The RealSense default limit is 200 000 us; at 90 fps that
@@ -106,6 +116,11 @@ def generate_launch_description():
             'enable_sync': True,
             'initial_reset': False,
         }],
+        remappings=[
+            (f'/camera/{stream}/{suffix}', f'/camera/raw/{stream}/{suffix}')
+            for stream in ('infra1', 'infra2', 'depth')
+            for suffix in ('image_rect_raw', 'metadata')
+        ] if _ALTERNATING else [],
     )
 
     visual_slam_node = ComposableNode(
@@ -125,7 +140,9 @@ def generate_launch_description():
             'accel_random_walk': 0.003,
             'calibration_frequency': 200.0,
 
-            'image_jitter_threshold_ms': 22.00,
+            # Allow one dropped exposure plus timestamp jitter at the split rate.
+            'image_jitter_threshold_ms': (5000.0 / _CAMERA_FPS
+                                          if _ALTERNATING else 22.0),
 
             # Pure visual odometry: no mapping, no loop closure.
             #
@@ -173,5 +190,10 @@ def generate_launch_description():
         output='screen',
     )
 
-    return launch.LaunchDescription([visual_slam_launch_container,
-                                     realsense_camera_node])
+    processes = [visual_slam_launch_container, realsense_camera_node]
+    if _ALTERNATING:
+        processes.append(ExecuteProcess(
+            cmd=[sys.executable, os.path.join(os.path.dirname(__file__),
+                                             'realsense_streams.py')],
+            output='screen'))
+    return launch.LaunchDescription(processes)

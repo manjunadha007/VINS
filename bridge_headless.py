@@ -496,6 +496,8 @@ class HeadlessBridge:
                                else solution.distance_pnp_m),
                 "distance_depth_m": (None if solution is None
                                      else solution.distance_depth_m),
+                # Every marker in the frame; the fields above are the first.
+                "visible": [{"dictionary": name, "id": fid} for name, fid, _ in markers],
             }
         except Exception as exc:
             print(f"[ArUco] detect error: {exc}")

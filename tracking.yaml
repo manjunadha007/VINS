@@ -120,10 +120,47 @@ tracking:
 
 aruco:
   enabled: true
+  # The printed set is DICT_4X4_250 (IDs 0-249). Every marker in the frame is
+  # detected; scanning several families costs a detector pass each.
   dictionaries:
-    - "DICT_4X4_50"
-  marker_size_m: 0.10
+    - "DICT_4X4_250"
+  # Measured from depth on the printed set: A4 sheets from chev.me/arucogen,
+  # 176 mm in the PDF, ~167 mm on paper after the printer's fit-to-page.
+  marker_size_m: 0.167            # every printed square is assumed this width
   lineup_marker_id: -1           # or select the specific ID in the dashboard
+  # Assigned viewport Locators enable joint marker matching automatically.
+  marker_support_rate_hz: 2.0     # background checks after the first lineup
+  marker_max_reprojection_px: 3.0 # agreement of each marker's four corners
+
+  # ── Auto lineup: how far from the Locator to look for the marker ─────────
+  # The scan is searched for the marker anywhere within this distance of the
+  # Locator, along the floor, at every heading. Starts are laid on a grid of
+  # lineup_search_step_m, ranked cheaply, and the best go through ICP.
+  # Floor markers and upright wall markers both work. Measured on Room01 with
+  # simulated D455 noise, Locator 0 / 0.3 / 0.6 / 0.9 m off: floor 28 / 22 /
+  # 23 / 20 of 32 correct, wall 21 / 19 / 20 / 18 of 24, none wrong, the rest
+  # refused as ambiguous. The old Locator-only search got 26 / 19 / 0 / 0 of
+  # 32 floor lineups right and 22 wrong. ~1.5 s per lineup, was ~0.5 s. This
+  # is separate from lidar.hint_radius_m, which still bounds LOCK TO SCAN and
+  # how far ICP may move from any one start.
+  lineup_search_radius_m: 1.0
+  lineup_search_step_m: 0.15
+
+  # ── Auto-placing every other marker ──────────────────────────────────────
+  # After Auto lineup locks, each detected marker that no Locator has is
+  # placed in the scan from the locked camera, gets its own Locator and joins
+  # the joint solve and the 2 Hz marker support. The lineup marker's ID goes
+  # to its own Locator. A marker is placed only after auto_place_min_sightings
+  # sightings agree on one pose within the tolerances, and no other pose is
+  # nearly as well supported -- the planar PnP ambiguity, which a little
+  # camera movement settles. Placed markers inherit the lineup's error, so
+  # they hold tracking to the lineup; Save marker layout keeps them for the
+  # next session.
+  auto_place_markers: true
+  auto_place_min_sightings: 6
+  auto_place_tolerance_m: 0.03
+  auto_place_tolerance_deg: 6.0
+  auto_place_min_marker_px: 24    # sqrt of the square's image area
 
 lidar:
   # ═════════════════════════════════════════════════════════════════════════
@@ -328,6 +365,7 @@ fusion:
   enabled: true
   require_lineup: true
   scan_timeout_s: 0.8
+  markers_timeout_s: 1.2
   gnss_timeout_s: 0.8
   # After lineup, keep following fresh stereo/IMU motion when scan checks
   # fail or arrive late. The status stays amber until scan validation recovers.
@@ -343,9 +381,9 @@ fusion:
   recovery_slew_deg_s: 5.0
 
 gnss:
-  # Studio work: leave this off. It exists for outdoor large-volume shoots.
-  enabled: false
-  port: "/dev/ttyACM0"
+  # Read the connected receiver; fusion still requires calibrated, fixed RTK.
+  enabled: true
+  port: "/dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00"
   baud: 115200
   # Keep false until the outdoor setup in RTK_SETUP.md is complete.
   calibrated: false
@@ -366,6 +404,18 @@ timecode:
   # LTC decoded from the audio input, shown on the dashboard for slating.
   enabled: true
 
+gopro:
+  # Webcam preview of a GoPro HERO10 on USB, beside the 3D view. Display only.
+  # Streaming stops the GoPro charging; the hub's power bank holds its battery.
+  auto_start: true      # start the preview when the dashboard opens
+  host: auto            # found from the USB link (172.2X.1YZ.51), or set the IP
+  resolution: 720       # 720 or 1080
+  fov: linear           # wide, narrow or linear (linear has no fisheye)
+
 ui:
   refresh_hz: 60
   trajectory_points: 3000
+  # On GNOME/Wayland with the NVIDIA driver, Xwayland stops showing a maximized
+  # X11 window (it looks frozen until restored). Maximize instead fills the same
+  # area as a normal window. Set false on a desktop without that problem.
+  hold_maximize_as_normal: true

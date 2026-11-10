@@ -1,12 +1,14 @@
 """Floor-marker pose, synchronized capture and isolated scan-search tests."""
 import copy
+import math
 import time
 import unittest
 from unittest.mock import Mock
 import numpy as np
 import cv2
 from marker_lineup import (MarkerObservation, capture_marker_observation,
-                           floor_marker_hint, matcher_snapshot, solve_marker_observation)
+                           floor_marker_hint, marker_search_offsets, matcher_snapshot,
+                           solve_marker_observation)
 from pose_transform import (T_BODY_OPTICAL, invert_transform, make_transform,
                             matrix_to_quaternion, rpy_to_matrix)
 from lidar_map_matcher import LidarMapMatcher, MapMeasurement
@@ -42,6 +44,21 @@ def fixture():
 
 
 class FloorMarkerTests(unittest.TestCase):
+    def test_search_grid_covers_the_radius_nearest_first(self):
+        offsets = marker_search_offsets(1., .15)
+        distances = [math.hypot(*o) for o in offsets]
+        self.assertNotIn((0., 0.), offsets, "the Locator's own seeds are always searched")
+        self.assertEqual(distances, sorted(distances))
+        self.assertLessEqual(max(distances), 1. + .15 / math.sqrt(2) + 1e-9)
+        grid = np.array([(0., 0.)] + offsets)
+        rng = np.random.default_rng(0)
+        r, a = np.sqrt(rng.random(2000)) * 1., rng.random(2000) * 2 * np.pi
+        points = np.c_[r * np.cos(a), r * np.sin(a)]
+        gaps = np.min(np.linalg.norm(points[:, None] - grid[None], axis=2), axis=1)
+        self.assertLess(gaps.max(), .15 / math.sqrt(2) + 1e-9)
+        self.assertEqual(marker_search_offsets(0., .15), [])
+        self.assertEqual(marker_search_offsets(1., 0.), [])
+
     def test_known_camera_pose_is_recovered_from_marker_at_nonzero_location(self):
         obs, truth, camera = fixture()
         hint = floor_marker_hint(obs)
@@ -112,6 +129,21 @@ class MarkerHeadingGeometryTests(unittest.TestCase):
         for seed, slam_locator, _ in marker_heading_seeds(obs):
             np.testing.assert_allclose((seed @ slam_locator)[:3, 2], obs.up_map, atol=1e-12)
 
+    def test_measured_tilt_snaps_to_flat_or_upright_on_a_wall(self):
+        from marker_lineup import level_marker
+        up = np.array([0., 0., 1.])
+        floor, on_wall = level_marker(rpy_to_matrix(.12, -.08, .9), up)
+        self.assertFalse(on_wall)
+        np.testing.assert_allclose(floor[:, 2], up, atol=1e-12)
+        self.assertLess(abs(np.arctan2(floor[1, 0], floor[0, 0]) - .9), .02, "heading kept")
+        leaning = rpy_to_matrix(0, np.radians(80), 0) @ rpy_to_matrix(0, 0, np.radians(90))
+        wall, on_wall = level_marker(leaning, up)
+        self.assertTrue(on_wall)
+        self.assertAlmostEqual(wall[:, 2] @ up, 0, places=12)
+        self.assertGreater(wall[:, 2] @ leaning[:, 2], np.cos(np.radians(11)))
+        np.testing.assert_allclose(wall.T @ wall, np.eye(3), atol=1e-12)
+        self.assertAlmostEqual(np.linalg.det(wall), 1, places=12)
+
     def test_coarse_success_cannot_escape_a_failed_fine_check(self):
         from unittest.mock import patch
         obs, _, _ = fixture()
@@ -120,7 +152,8 @@ class MarkerHeadingGeometryTests(unittest.TestCase):
         m._ensure_pyramid = Mock()
         m._deproject = Mock(return_value=np.zeros((100, 3)))
         m._map_tree = Mock()
-        m._map_tree.query.return_value = (np.zeros(100), np.zeros(100, int))
+        m._map_tree.query.side_effect = lambda points, **_: (np.zeros(len(points)),
+                                                             np.zeros(len(points), int))
         def measure(depth, K, pose, prior, stages, **kwargs):
             if stages[-1][0] == 1:
                 return MapMeasurement(reason="Fine scan verification rejected")
@@ -176,6 +209,17 @@ class MarkerCaptureTests(unittest.TestCase):
     def test_wrong_id_or_dictionary_cannot_anchor(self):
         self.assertIsNone(self.capture(marker_id=8)[0])
         self.assertIsNone(self.capture(family="DICT_4X4_1000")[0])
+
+    def test_a_square_width_that_disagrees_with_depth_is_refused(self):
+        # The rig's 16.7 cm prints entered as 10 cm: every marker 40% too close.
+        captured, reason = self.capture(marker_size_m=0.06)
+        self.assertIsNone(captured)
+        self.assertIn("measures about 10.0 cm across from depth", reason)
+        self.assertIn("Square width is 6.0 cm", reason)
+        self.assertIsNotNone(self.capture(marker_size_m=0.095)[0], "within depth noise")
+        self.engine.set_depth(np.zeros((480, 848), np.uint16), self.obs.depth_K, stamp=10.1)
+        captured, reason = self.capture(marker_size_m=0.06)
+        self.assertIsNotNone(captured, "no depth on the marker: nothing to judge, so no refusal")
 
     def test_unspecified_id_requires_one_marker(self):
         captured, reason = self.capture(marker_id=-1)

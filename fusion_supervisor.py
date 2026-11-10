@@ -34,15 +34,16 @@ class FusionSupervisor:
                 fresh = 0 <= age <= self.cfg.get(name + "_timeout_s", 0.8)
                 ready = fresh and item["ok"] and item["consecutive"] >= self.cfg.get("recovery_samples", 3)
                 sources[name] = dict(item, age_s=max(0.0, age), fresh=fresh, ready=ready)
-            supported = [s for s in ("scan", "gnss") if sources.get(s, {}).get("ready")]
+            supported = [s for s in ("scan", "markers", "gnss") if sources.get(s, {}).get("ready")]
             if not pose_fresh:
                 state, reason = "HOLD", "Camera pose missing, stale, or rejected"
             elif self.cfg.get("require_lineup", True) and not aligned:
                 state, reason = "ALIGNING", "Place the camera in the scan and complete lineup"
             elif supported:
                 self.last_supported = now
-                state = "VALIDATED" if "scan" in supported else "RTK_ASSISTED"
+                state = "VALIDATED" if "scan" in supported or "markers" in supported else "RTK_ASSISTED"
                 reason = ("Stereo / IMU with depth-to-scan validation" if "scan" in supported
+                          else "Stereo / IMU with surveyed markers and depth-to-scan validation" if "markers" in supported
                           else "Stereo / IMU with RTK position check; rotation is camera-only")
             elif aligned and self.cfg.get("allow_vio_fallback", True):
                 # The scan estimates the world alignment; VIO supplies live

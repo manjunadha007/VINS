@@ -332,6 +332,9 @@ class LidarMapMatcher:
         self._worker = None
         self._worker_stop = threading.Event()
         self._pending = None
+        self._pending_marker = None
+        self.last_marker_measurement = None
+        self._last_marker_fix_time = -float("inf")
         self._pending_lock = threading.Condition()
         self.last_icp_time = 0.0
         self._last_fuse_time = None
@@ -456,6 +459,7 @@ class LidarMapMatcher:
         self.confidence = 0.0
         self.T_slam_to_map = np.eye(4)
         self.last_measurement = None
+        self.discard_marker_fixes()
         self._generation += 1
         if self.edge_aligner is not None:
             self.edge_aligner.clear_mesh()
@@ -613,6 +617,7 @@ class LidarMapMatcher:
         """
         self._generation += 1
         self.last_measurement = None
+        self.discard_marker_fixes()
         self.T_slam_to_map = np.asarray(T_slam_to_map, dtype=float).copy()
         self.is_aligned = True
         self.alignment_source = source
@@ -815,6 +820,7 @@ class LidarMapMatcher:
         # minutes. Continuous fusion holds it from here.
         self._generation += 1
         best.monotonic_timestamp = time.monotonic() if captured_at is None else captured_at
+        self.discard_marker_fixes()
         self.last_measurement = best
         self.T_slam_to_map = best.T_slam_to_map.copy()
         self.is_aligned = True
@@ -959,9 +965,19 @@ class LidarMapMatcher:
     def _worker_loop(self):
         while not self._worker_stop.is_set():
             with self._pending_lock:
-                while self._pending is None and not self._worker_stop.is_set():
+                while self._pending is None and self._pending_marker is None and not self._worker_stop.is_set():
                     self._pending_lock.wait(timeout=0.5)
-                job, self._pending = self._pending, None
+                marker_job, self._pending_marker = self._pending_marker, None
+                if marker_job is None:
+                    job, self._pending = self._pending, None
+                else:
+                    job = None
+            if marker_job is not None and not self._worker_stop.is_set():
+                try:
+                    self._apply_marker_fix(*marker_job)
+                except Exception as exc:
+                    print(f"[LiDAR] marker correction error: {exc}")
+                continue
             if job is None or self._worker_stop.is_set():
                 continue
             try:
@@ -970,6 +986,47 @@ class LidarMapMatcher:
                 self.update_depth(*job)
             except Exception as exc:                   # keep the thread alive
                 print(f"[LiDAR] fusion worker error: {exc}")
+
+    def discard_marker_fixes(self):
+        with self._pending_lock:
+            self._pending_marker = None
+        self.last_marker_measurement = None
+
+    def submit_marker_fix(self, measurement, capture_pose, generation):
+        """Serialize mapped-marker corrections with ICP on the same worker."""
+        if (not self.is_aligned or generation != self._generation or not measurement.ok
+                or measurement.monotonic_timestamp is None):
+            return False
+        if any(np.shape(T) != (4, 4) or not np.isfinite(T).all()
+               for T in (measurement.T_slam_to_map, capture_pose)):
+            return False
+        job = (measurement, np.array(capture_pose, copy=True), generation)
+        if self._worker is None:
+            return self._apply_marker_fix(*job)
+        with self._pending_lock:
+            self._pending_marker = job
+            self._pending_lock.notify()
+        return True
+
+    def _apply_marker_fix(self, measurement, capture_pose, generation):
+        now, stamp = time.monotonic(), measurement.monotonic_timestamp
+        if (generation != self._generation or not self.is_aligned or stamp is None
+                or stamp <= self._last_marker_fix_time
+                or not 0 <= now - stamp <= self.config.get("max_measurement_age_s", .6)):
+            return False
+        distance, angle = self._camera_delta(self.T_slam_to_map, measurement.T_slam_to_map, capture_pose)
+        measurement.translation_m, measurement.rotation_deg = distance, angle
+        if distance > self.max_correction_m or angle > self.max_correction_deg:
+            measurement.ok = False
+            measurement.reason = "Mapped markers disagree with live alignment; check locator placement or repeat lineup."
+        self._last_marker_fix_time = stamp
+        self.last_marker_measurement = measurement
+        if not measurement.ok:
+            return False
+        # No origin reset and no new alignment generation: only a gradual fix.
+        self._fuse(measurement, capture_pose, now)
+        self._update_diagnostics(measurement)
+        return True
 
     # ── the continuous loop ──────────────────────────────────────────────────
     def update_depth(self, depth_mm, K, current_pose, timestamp=None,

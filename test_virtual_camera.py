@@ -444,6 +444,63 @@ class TestTrajectoryCanvas(VirtualCameraTestCase):
         canvas.repaint()
 
 
+class TestMaximizeHeldAsNormalWindow(VirtualCameraTestCase):
+    """The rig's Xwayland freezes a window left in the maximized state."""
+
+    def _window(self, hold=True):
+        from PyQt5.QtWidgets import QMainWindow
+
+        class Window(dashboard.MaximizeAsNormalWindow, QMainWindow):
+            pass
+        window = Window()
+        window.hold_maximize_as_normal = hold
+        window.setGeometry(100, 100, 400, 300)
+        window.show()
+        self._settle()
+        self.addCleanup(window.close)
+        return window
+
+    def _settle(self, seconds=0.6):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            self.qapp.processEvents()
+            time.sleep(0.01)
+
+    def test_maximize_toggles_between_filled_and_previous_size(self):
+        from PyQt5.QtCore import Qt
+        window = self._window()
+        small = window.geometry()
+        window.setWindowState(Qt.WindowMaximized)
+        self._settle()
+        self.assertEqual(window.windowState(), Qt.WindowNoState)
+        filled = window.geometry()
+        self.assertGreater(filled.width(), small.width())
+        self.assertGreater(filled.height(), small.height())
+
+        window.setWindowState(Qt.WindowMaximized)
+        self._settle()
+        self.assertEqual(window.windowState(), Qt.WindowNoState)
+        self.assertEqual(window.geometry(), small)
+
+        window.setWindowState(Qt.WindowMaximized)
+        self._settle()
+        self.assertEqual(window.geometry(), filled)
+
+    def test_fullscreen_is_left_alone(self):
+        from PyQt5.QtCore import Qt
+        window = self._window()
+        window.setWindowState(Qt.WindowFullScreen)
+        self._settle()
+        self.assertTrue(window.windowState() & Qt.WindowFullScreen)
+
+    def test_switched_off_leaves_maximize_alone(self):
+        from PyQt5.QtCore import Qt
+        window = self._window(hold=False)
+        window.setWindowState(Qt.WindowMaximized)
+        self._settle()
+        self.assertTrue(window.windowState() & Qt.WindowMaximized)
+
+
 class TestCameraChannelEditing(VirtualCameraTestCase):
     def test_camera_editor_keeps_roll_pitch_and_yaw_in_map_coordinates(self):
         from types import SimpleNamespace
@@ -465,6 +522,56 @@ class TestCameraChannelEditing(VirtualCameraTestCase):
         np.testing.assert_allclose(gui._lineup.T_map_cam, invert_transform(alignment) @ desired)
         np.testing.assert_array_equal(gui._lineup.history[-1], previous)
         gui._refresh_lineup.assert_called_once()
+
+
+class TestProjectorSwitch(VirtualCameraTestCase):
+    def test_switch_waits_for_camera_confirmation_and_shows_rejections(self):
+        from unittest.mock import Mock
+        from types import SimpleNamespace
+        from PyQt5.QtWidgets import QMainWindow, QPushButton, QLabel
+        from projector_control import ProjectorControl
+        from test_projector_control import Parameters
+
+        gui = self._make_gui()
+        QMainWindow.__init__(gui)
+        gui.btn_projector = QPushButton(gui)
+        gui.btn_projector.setCheckable(True)
+        gui.lbl_projector_status = QLabel(gui)
+        gui.btn_projector.toggled.connect(gui._toggle_projector)
+        gui.ros_node = Mock()
+        gui.ros_node.get_publishers_info_by_topic.return_value = [
+            SimpleNamespace(node_name="vp_realsense_splitter")]
+        params = Parameters()
+        gui._projector = ProjectorControl(params)
+        try:
+            gui._refresh_projector()
+            self.assertFalse(gui.btn_projector.isEnabled())
+            params.state(1, True)
+            gui._refresh_projector()
+            self.assertTrue(gui.btn_projector.isChecked())
+            self.assertTrue(gui.btn_projector.isEnabled())
+            # Synchronizing the button must not issue a parameter write.
+            self.assertEqual(len(params.requests), 1)
+            gui.btn_projector.click()
+            self.assertFalse(gui.btn_projector.isEnabled())
+            self.assertIn("APPLYING", gui.btn_projector.text())
+            self.assertTrue(gui.btn_projector.isChecked())
+            for _ in range(2):
+                params.accepted()
+                gui._refresh_projector()
+            params.state(0, False)
+            gui._refresh_projector()
+            self.assertFalse(gui.btn_projector.isChecked())
+            self.assertTrue(gui.btn_projector.isEnabled())
+            self.assertEqual("IR PROJECTOR: OFF", gui.btn_projector.text())
+            gui.btn_projector.click()
+            params.accepted(False, "device busy")
+            gui._refresh_projector()
+            self.assertIn("device busy", gui.lbl_projector_status.text())
+            self.assertFalse(gui.btn_projector.isEnabled())
+        finally:
+            gui._projector.close()
+            gui.deleteLater()
 
 
 class TestMarkerAssistedLineup(VirtualCameraTestCase):
@@ -502,6 +609,8 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
                                    [0, 0, 0], [0, 0, 0], stamp=stamp)
         gui.engine.set_depth(obs.depth, obs.depth_K, stamp=10.1)
         gui.map_viewer.set_locator_transform(obs.T_map_locator)
+        # The fixture's printed square, whatever this rig's tracking.yaml says.
+        gui.marker_width.setValue(obs.marker_size_m)
         gui.btn_marker_lineup.setChecked(True)
         def cleanup():
             gui._marker_shutdown = True
@@ -510,6 +619,593 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
             self.qapp.sendPostedEvents(None, QEvent.DeferredDelete)
         self.addCleanup(cleanup)
         return gui, obs, truth
+
+    def _mapped_gui(self, scene=None):
+        from marker_map import locator_transform
+        from test_marker_map import fixture
+        gui, _, _ = self._marker_gui()
+        gui.btn_marker_lineup.setChecked(False)
+        observation, truth, records = scene or fixture()
+        view = gui.map_viewer.persp_view
+        for i, record in enumerate(records):
+            if i:
+                view.duplicate_locator()
+            view.set_locator_transform(locator_transform(record))
+            view.assign_locator_marker(record['dictionary'], record['id'], record['size_m'])
+        marker = observation.markers[0]
+        # The engine keeps the first camera_info; this scene's camera is its own.
+        gui.engine.intrinsics_from_camera_info = False
+        gui.engine.set_intrinsics(marker.K)
+        for stamp, T in ((11., marker.T_slam_image), (11.1, marker.T_slam_depth)):
+            gui.engine.accept_pose(T[:3,3], matrix_to_quaternion(T[:3,:3]),
+                                   [0,0,0], [0,0,0], stamp=stamp)
+        gui.engine.set_depth(marker.depth, marker.depth_K, stamp=11.1)
+        for m in observation.markers:
+            m.captured_at = time.monotonic()
+        # These fixtures exercise the rigid solve after scale calibration.
+        gui._toggle_marker_lineup(True, calibrate_scale=False)
+        return gui, observation, truth, records
+
+    @staticmethod
+    def _mapped_measurement(observation, truth):
+        from marker_map import MappedMeasurement
+        from lidar_map_matcher import MapMeasurement
+        scan = MapMeasurement(ok=True, T_slam_to_map=truth, fitness=.9,
+                              verify_score=.9, observable_rank=1)
+        scan.monotonic_timestamp = observation.captured_at
+        return MappedMeasurement(scan, [(m.family, m.marker_id) for m in observation.markers], [], .1)
+
+    def test_mapped_layout_selection_preserves_request_but_pose_edits_cancel(self):
+        from marker_map import layout_signature
+        gui, observation, truth, records = self._mapped_gui()
+        view = gui.map_viewer.persp_view
+        request = gui._marker_request
+        self.assertEqual(layout_signature(request['records']), layout_signature(records))
+        self.assertAlmostEqual(view._locator_marker_size, records[-1]['size_m'])
+        view.outliner_list.setCurrentRow(4)
+        self.assertEqual(gui._marker_request_changed(request), '')
+        view._edit_channel(0, view._locator_pos[0] + .2)
+        gui._finish_marker_lineup((request, observation,
+            self._mapped_measurement(observation, truth), ''))
+        self.assertFalse(gui.lidar_matcher.is_aligned)
+        self.assertIn('locator poses changed', gui.lbl_marker_lineup.text())
+
+    def test_rejected_survey_explains_positions_are_kept_and_orientations_measured(self):
+        from lidar_map_matcher import MapMeasurement
+        gui, observation, truth, records = self._mapped_gui()
+        gui._finish_marker_lineup((gui._marker_request, observation,
+            MapMeasurement(reason="Survey pose has 10% depth agreement"), ''))
+        self.assertIn('10% depth agreement', gui.lbl_marker_lineup.text())
+        self.assertIn('positions are kept fixed', gui.lbl_marker_lineup.text())
+        self.assertIn('orientations are measured', gui.lbl_marker_lineup.text())
+        self.assertNotIn('Clear ID', gui.lbl_marker_lineup.text())
+
+    def test_mapped_acquisition_and_live_support_use_background_joint_solver(self):
+        from unittest.mock import patch, Mock
+        from test_marker_map import room_fixture
+        with patch('time.monotonic', return_value=100.) as mono:
+            gui, observation, truth, _ = self._mapped_gui(room_fixture())
+            measurement = self._mapped_measurement(observation, truth)
+            gui.marker_lineup_finished.connect(gui._finish_marker_lineup)
+            def run_inline(**kwargs):
+                return Mock(start=kwargs['target'])
+            mono.return_value = 100.05
+            detections = [(m.family, m.marker_id, m.corners) for m in observation.markers]
+            gui._marker_detection_sample = (detections, 11., 100.05, (848,480))
+            with patch('dashboard.threading.Thread', side_effect=run_inline), \
+                    patch('dashboard.solve_mapped_observation', return_value=measurement) as solve:
+                gui._poll_marker_lineup()
+                solve.assert_called_once()
+                self.assertEqual(len(solve.call_args.args[0].markers), 3)
+                self.assertTrue(gui.lidar_matcher.is_aligned)
+                generation = gui.lidar_matcher._generation
+                # Same frame is never recycled as new evidence.
+                gui._poll_marker_lineup()
+                self.assertEqual(solve.call_count, 1)
+                mono.return_value = 100.60
+                gui.engine._last_pose_mono = mono.return_value
+                gui.engine.set_depth(observation.markers[0].depth, observation.markers[0].depth_K, stamp=11.1)
+                gui._marker_detection_sample = (detections, 11., 100.60, (848,480))
+                measurement.monotonic_timestamp = 100.60
+                gui._poll_marker_lineup()
+                self.assertEqual(solve.call_count, 2)
+                self.assertEqual(gui.lidar_matcher._generation, generation)
+                gui._push_map_alignment.assert_called_once()  # no new initial lineup
+                self.assertIs(gui.lidar_matcher.last_marker_measurement, measurement)
+
+    def test_lineup_stands_wrongly_rotated_wall_locators_up_before_solving(self):
+        from unittest.mock import patch, Mock
+        from marker_map import layout_signature, locator_transform
+        from lidar_map_matcher import MapMeasurement
+        from test_marker_map import ROOM_MARKERS, room_fixture, rotation_error_deg
+        # As on the rig: ID 1 left flat after Duplicate, ID 2 stood up sideways.
+        with patch('time.monotonic', return_value=100.) as mono:
+            gui, observation, truth, records = self._mapped_gui(room_fixture({1: (0, 0, 0), 2: (90, 0, 0)}))
+            request = gui._marker_request
+            mono.return_value = 100.05
+            detections = [(m.family, m.marker_id, m.corners) for m in observation.markers]
+            gui._marker_detection_sample = (detections, 11., 100.05, (848, 480))
+            with patch('dashboard.threading.Thread', side_effect=lambda **kw: Mock(start=kw['target'])), \
+                    patch('dashboard.solve_mapped_observation',
+                          return_value=MapMeasurement(reason="Survey pose has 40% depth agreement")) as solve:
+                gui.marker_lineup_finished.connect(gui._finish_marker_lineup)
+                gui._poll_marker_lineup()
+        placed = {r['id']: locator_transform(r) for r in gui._mapped_marker_records()}
+        for fid, (position, _) in ROOM_MARKERS.items():
+            truth_locator = locator_transform(dict(position_m=position, rotation_deg=ROOM_MARKERS[fid][1]))
+            self.assertLess(rotation_error_deg(placed[fid], truth_locator), 2, fid)
+            np.testing.assert_allclose(placed[fid][:3, 3], position, atol=1e-9)
+        solved = {m.marker_id: m.T_map_locator for m in solve.call_args.args[0].markers}
+        for fid in (1, 2):
+            np.testing.assert_allclose(solved[fid], placed[fid], atol=1e-9)
+        self.assertEqual(request['layout_signature'], layout_signature(gui._mapped_marker_records()))
+        text = gui.lbl_marker_lineup.text()
+        self.assertIn('40% depth agreement', text)
+        self.assertIn('Turned Locator ID 1 upright on its wall (90°), ID 2 upright on its wall (90°)', text)
+        self.assertNotIn('changed', text)
+
+    def test_unclear_orientations_wait_instead_of_using_the_hand_entered_angles(self):
+        from unittest.mock import patch
+        from test_marker_map import room_fixture
+        with patch('time.monotonic', return_value=100.) as mono:
+            gui, observation, _, _ = self._mapped_gui(room_fixture(depth=False))
+            request = gui._marker_request
+            before = gui.map_viewer.persp_view.locator_entries()
+            mono.return_value = 100.05
+            detections = [(m.family, m.marker_id, m.corners) for m in observation.markers]
+            gui._marker_detection_sample = (detections, 11., 100.05, (848, 480))
+            with patch('dashboard.solve_mapped_observation') as solve:
+                gui._poll_marker_lineup()
+                solve.assert_not_called()
+            self.assertIs(gui._marker_request, request)
+            self.assertTrue(gui.btn_marker_lineup.isChecked())
+            self.assertIn('waiting to measure their orientations', gui.lbl_marker_lineup.text())
+            for key, entry in gui.map_viewer.persp_view.locator_entries().items():
+                np.testing.assert_array_equal(entry['transform'][:3, 3], before[key]['transform'][:3, 3])
+
+    def test_orientation_measurement_preserves_exact_displayed_centres(self):
+        from test_marker_map import room_fixture
+        from marker_map import MappedObservation
+        from dataclasses import replace
+        gui, observation, _, _ = self._mapped_gui(room_fixture({1: (0, -85, 4)}))
+        gui.map_viewer.set_alignment(1.1234, -.5678, .9012, 12.345, 8.901, -67.891, 1.)
+        rigid = gui._align_rigid()
+        view = gui.map_viewer.persp_view
+        entries = view.locator_entries()
+        for key, entry in entries.items():
+            view.set_locator_transform(rigid @ entry['transform'], key)
+        before = view.locator_entries()
+        request = dict(gui._marker_request, rigid=rigid)
+        observation = MappedObservation(tuple(replace(m, up_map=np.array([0., 0., 1.]))
+                                               for m in observation.markers))
+        gui._level_assigned_locators(request, observation)
+        self.assertTrue(request['orientation_ready'])
+        for key, entry in view.locator_entries().items():
+            np.testing.assert_array_equal(entry['transform'][:3, 3], before[key]['transform'][:3, 3])
+
+    def test_marker_not_seen_during_orientation_measurement_cannot_support_tracking(self):
+        from unittest.mock import patch
+        from test_marker_map import room_fixture
+        with patch('time.monotonic', return_value=100.) as mono:
+            gui, obs, _, _ = self._mapped_gui(room_fixture())
+            request = gui._marker_request
+            request['oriented_marker_keys'] = tuple((m.family, m.marker_id) for m in obs.markers[:2])
+            gui._marker_request = None
+            gui._marker_lock_context = request
+            mono.return_value = 100.1
+            m = obs.markers[2]
+            gui._marker_detection_sample = ([(m.family, m.marker_id, m.corners)], 11., 100.1, (848, 480))
+            with patch('dashboard.solve_mapped_observation') as solve:
+                gui._poll_marker_lineup()
+                solve.assert_not_called()
+            self.assertFalse(gui._marker_busy)
+
+    def _scale_gui(self, measured):
+        """A lined-up window with Setup → Scan scale, and measure_scale answering `measured`."""
+        from unittest.mock import patch, Mock
+        gui, obs, truth = self._marker_gui()
+        gui.btn_marker_lineup.setChecked(False)
+        gui.lidar_cfg = dict(gui.cfg.get("lidar", {}), map_scale=.01)
+        gui._build_scan_scale_panel().setParent(gui)
+        gui.scan_scale_finished.connect(gui._finish_scale_measurement)
+        matcher = gui.lidar_matcher
+        matcher._map_native = np.random.default_rng(0).random((400, 3)) * 300
+        gui.map_viewer.set_alignment_scale(.01)
+        gui._align_rigid()
+        matcher.is_aligned, matcher.T_slam_to_map = True, truth.copy()
+        threads = patch('dashboard.threading.Thread', side_effect=lambda **kw: Mock(start=kw['target']))
+        measure = patch('dashboard.measure_scale', return_value=dict(
+            dict(ok=True, scale=1., sigma=.01, inliers=.8, rmse_m=.015, lever_m=1.2), **measured))
+        threads.start()
+        self.addCleanup(threads.stop)
+        return gui, obs, truth, measure.start(), measure
+
+    def test_scale_sweep_measures_then_apply_rescales_scan_and_locators(self):
+        from marker_map import locator_transform
+        gui, obs, truth, measure, patcher = self._scale_gui(dict(scale=.95))
+        self.addCleanup(patcher.stop)
+        view = gui.map_viewer.persp_view
+        view.duplicate_locator()
+        view.set_locator_transform(locator_transform(dict(position_m=(1., -2., .5), rotation_deg=(0, -90, 90))))
+        before = {key: entry['transform'].copy() for key, entry in view.locator_entries().items()}
+        gui._toggle_scale_sweep()
+        self.assertEqual(gui.btn_measure_scale.text(), "Stop and measure")
+        self.assertEqual(gui._scale_sweep['sweep'].frames, 1)
+        gui._collect_scale_sweep()            # the same depth frame is not added twice
+        self.assertEqual(gui._scale_sweep['sweep'].frames, 1)
+        gui._toggle_scale_sweep()             # stop early and measure
+        measure.assert_called_once()
+        points, scan, T = measure.call_args.args
+        self.assertGreater(len(points), 100)
+        np.testing.assert_allclose(scan, gui.lidar_matcher._map_native * .01)
+        np.testing.assert_allclose(T, truth)
+        text = gui.lbl_scan_scale.text()
+        self.assertIn("5.0% smaller than the room", text)
+        self.assertIn("from 0.01 to 0.010526 m per unit", text)
+        self.assertTrue(gui.btn_apply_scale.isEnabled())
+        self.assertEqual(gui.btn_measure_scale.text(), "Measure scan scale")
+        gui._apply_scan_scale()
+        self.assertAlmostEqual(gui.map_viewer.alignment_scale, .01 / .95)
+        self.assertAlmostEqual(gui.lidar_matcher.map_scale, .01 / .95)
+        self.assertAlmostEqual(gui.lidar_cfg["map_scale"], .01 / .95)
+        for key, entry in view.locator_entries().items():
+            np.testing.assert_allclose(entry['transform'][:3, 3], before[key][:3, 3] / .95, atol=1e-9)
+            np.testing.assert_allclose(entry['transform'][:3, :3], before[key][:3, :3], atol=1e-9)
+        self.assertIn("Run Auto lineup again", gui.lbl_scan_scale.text())
+        self.assertFalse(gui.btn_apply_scale.isEnabled())
+
+    def test_scale_within_the_cameras_accuracy_needs_no_change(self):
+        gui, *_, patcher = self._scale_gui(dict(scale=.985))
+        self.addCleanup(patcher.stop)
+        gui._toggle_scale_sweep()
+        gui._toggle_scale_sweep()
+        self.assertIn("No change needed", gui.lbl_scan_scale.text())
+        self.assertFalse(gui.btn_apply_scale.isEnabled())
+
+    def test_scale_sweep_refusals_are_reported_and_nothing_changes(self):
+        gui, *_, patcher = self._scale_gui(dict(ok=False, reason="This sweep can't measure scale: a corner."))
+        self.addCleanup(patcher.stop)
+        gui._toggle_scale_sweep()
+        gui._toggle_scale_sweep()
+        self.assertEqual(gui.lbl_scan_scale.text(), "This sweep can't measure scale: a corner.")
+        self.assertFalse(gui.btn_apply_scale.isEnabled())
+        self.assertAlmostEqual(gui.map_viewer.alignment_scale, .01)
+
+    def test_scale_needs_a_lineup_and_a_steady_scan(self):
+        gui, *_, patcher = self._scale_gui(dict(scale=.95))
+        self.addCleanup(patcher.stop)
+        gui.lidar_matcher.is_aligned = False
+        gui._toggle_scale_sweep()
+        self.assertIn("Line up first", gui.lbl_scan_scale.text())
+        self.assertIsNone(gui._scale_sweep)
+        gui.lidar_matcher.is_aligned = True
+        gui._toggle_scale_sweep()
+        gui.engine.gate.resyncs += 1
+        gui._collect_scale_sweep()
+        self.assertIn("Tracking jumped", gui.lbl_scan_scale.text())
+        self.assertIsNone(gui._scale_sweep)
+        gui._toggle_scale_sweep()
+        gui._toggle_scale_sweep()
+        self.assertTrue(gui.btn_apply_scale.isEnabled())
+        gui.map_viewer.set_alignment_scale(.02)
+        gui._align_rigid()
+        gui._apply_scan_scale()
+        self.assertIn("changed since the measurement", gui.lbl_scan_scale.text())
+        self.assertAlmostEqual(gui.map_viewer.alignment_scale, .02)
+
+    def _marker_scale_gui(self, nudges, grow=1.05):
+        """Assigned scan Locators; depth verification answers with the known scale."""
+        from unittest.mock import patch, Mock
+        from test_marker_map import ROOM_MARKERS, room_fixture
+        positions = {fid: grow * np.asarray(position) + nudges.get(fid, 0.)
+                     for fid, (position, _) in ROOM_MARKERS.items()}
+        gui, observation, T_map_slam, _ = self._mapped_gui(room_fixture(positions=positions))
+        gui.lidar_cfg = dict(gui.cfg.get("lidar", {}), map_scale=.01)
+        gui._build_scan_scale_panel().setParent(gui)
+        gui.scan_scale_finished.connect(gui._finish_scale_measurement)
+        gui.lidar_matcher._map_native = np.random.default_rng(0).random((400, 3)) * 300
+        gui.map_viewer.set_alignment_scale(.01)
+        gui._align_rigid()
+        self.assertFalse(gui.lidar_matcher.is_aligned)
+        truth = T_map_slam.copy()
+        truth[:3] *= grow
+        threads = patch('dashboard.threading.Thread', side_effect=lambda **kw: Mock(start=kw['target']))
+        measure = patch('dashboard.verify_locator_scale', return_value=dict(
+            ok=True, scale=grow, sigma=.01, inliers=.8, rmse_m=.015, lever_m=1.2, T=truth))
+        threads.start()
+        self.addCleanup(threads.stop)
+        self.addCleanup(measure.stop)
+        detections = [(m.family, m.marker_id, m.corners) for m in observation.markers]
+
+        def show_markers():
+            gui._marker_detection_sample = (detections, 11., time.monotonic(), (848, 480))
+            gui._collect_scale_sweep()
+        return gui, truth, measure.start(), show_markers
+
+    def test_markers_scale_scan_with_all_locator_placements_preserved(self):
+        gui, truth, measure, show_markers = self._marker_scale_gui(
+            {1: (.006, -.004, .003), 2: (-.005, .003, -.004), 3: (.004, .007, 0.)})
+        view = gui.map_viewer.persp_view
+        # Include a Locator with no ID and a translated/rotated display frame.
+        view.duplicate_locator()
+        view.clear_locator_marker()
+        gui.map_viewer.set_alignment(2., -1., .5, 10., -8., 25., .01)
+        rigid = gui._align_rigid()
+        before = view.locator_entries()
+        self.assertIsNotNone(gui._marker_request)
+        gui._toggle_marker_lineup(True)             # normal Auto lineup starts calibration
+        self.assertIsNone(gui._marker_request)      # Auto lineup waits for the result
+        self.assertEqual(gui.btn_marker_lineup.text(), "Auto lineup · Measuring scale")
+        self.assertEqual(gui.btn_marker_scale.text(), "Stop and measure")
+        self.assertFalse(gui.btn_measure_scale.isEnabled())
+        for _ in range(3):
+            show_markers()
+        self.assertIn("Seen: ID 1 ×3, ID 2 ×3, ID 3 ×3", gui.lbl_scan_scale.text())
+        gui._toggle_scale_sweep(markers=True)        # stop and measure
+        measure.assert_called_once()
+        _, scan, fit = measure.call_args.args
+        np.testing.assert_allclose(scan, gui.lidar_matcher._map_native * .01)
+        self.assertAlmostEqual(fit["scale"], 1.05, delta=.01)
+
+        self.assertAlmostEqual(gui.map_viewer.alignment_scale, .01 / 1.05)
+        self.assertAlmostEqual(gui.lidar_matcher.map_scale, .01 / 1.05)
+        self.assertAlmostEqual(gui.lidar_cfg["map_scale"], .01 / 1.05)
+        for key, entry in view.locator_entries().items():
+            old = np.linalg.inv(rigid) @ before[key]["transform"]
+            new = np.linalg.inv(rigid) @ entry["transform"]
+            np.testing.assert_allclose(new[:3, 3], old[:3, 3] / 1.05, atol=1e-9)
+            np.testing.assert_allclose(new[:3, :3], old[:3, :3], atol=1e-9)
+            self.assertEqual(entry["marker"], before[key]["marker"])
+        placed = {e["marker"]["id"]: np.linalg.inv(rigid) @ e["transform"]
+                  for e in view.locator_entries().values() if e["marker"]}
+        text = gui.lbl_scan_scale.text()
+        self.assertIn("The scan was 5.0% larger than the room", text)
+        self.assertIn("from 0.01 to 0.0095238 m per unit", text)
+        self.assertIn("All Locators kept their positions on the scan", text)
+        self.assertIn("Auto lineup is running", text)
+        # Auto lineup starts again from the moved Locators.
+        self.assertTrue(gui.btn_marker_lineup.isChecked())
+        request = gui._marker_request
+        self.assertIsNotNone(request)
+        for record in request["records"]:
+            np.testing.assert_allclose(record["position_m"], placed[record["id"]][:3, 3], atol=1e-9)
+        self.assertEqual(gui.btn_marker_scale.text(), "Scale and line up from markers")
+        self.assertTrue(gui.btn_measure_scale.isEnabled())
+        self.assertFalse(gui.btn_apply_scale.isEnabled())
+
+    def test_marker_scale_refuses_unseen_or_misplaced_markers_and_changes_nothing(self):
+        for nudges, sightings, expected in (
+                ({}, 1, "Too few assigned markers were seen steadily (seen: none)"),
+                ({3: (1.4, -.6, 0.)}, 3, "do not agree under one uniform scale")):
+            with self.subTest(expected=expected):
+                gui, _, measure, show_markers = self._marker_scale_gui(nudges)
+                before = {key: e["transform"].copy()
+                          for key, e in gui.map_viewer.persp_view.locator_entries().items()}
+                gui._toggle_scale_sweep(markers=True)
+                for _ in range(sightings):
+                    show_markers()
+                gui._toggle_scale_sweep(markers=True)
+                self.assertIn(expected, gui.lbl_scan_scale.text())
+                measure.assert_not_called()
+                self.assertIsNone(gui._scale_sweep)
+                self.assertAlmostEqual(gui.map_viewer.alignment_scale, .01)
+                for key, e in gui.map_viewer.persp_view.locator_entries().items():
+                    np.testing.assert_allclose(e["transform"], before[key])
+                self.assertEqual(gui.btn_marker_scale.text(), "Scale and line up from markers")
+                self.assertTrue(gui.btn_measure_scale.isEnabled())
+
+    def test_marker_scale_needs_three_assigned_locators(self):
+        gui, *_ = self._marker_scale_gui({})
+        view = gui.map_viewer.persp_view
+        for key in list(view.locator_entries())[2:]:
+            view._locators[key]["marker"] = None
+        gui._toggle_scale_sweep(markers=True)
+        self.assertIn("Assign marker IDs to at least three Locators", gui.lbl_scan_scale.text())
+        self.assertIsNone(gui._scale_sweep)
+
+    def test_cancelled_or_changed_scale_request_cannot_apply_late_result(self):
+        for action in ("cancel", "locator", "scan", "tracking"):
+            with self.subTest(action=action):
+                gui, _, measure, _ = self._marker_scale_gui({})
+                gui._toggle_marker_lineup(True)
+                request = gui._scale_sweep
+                if action == "cancel":
+                    gui.btn_marker_lineup.setChecked(False)
+                elif action == "locator":
+                    T = gui.map_viewer.get_locator_transform().copy()
+                    T[0, 3] += .1
+                    gui.map_viewer.set_locator_transform(T)
+                elif action == "scan":
+                    gui.map_viewer.set_alignment(1, 0, 0, 0, 0, 0, .01)
+                else:
+                    gui.engine.gate.resyncs += 1
+                before = gui.map_viewer.persp_view.locator_entries()
+                gui._finish_scale_measurement((request, measure.return_value, ""))
+                self.assertIsNone(gui._scale_sweep)
+                self.assertAlmostEqual(gui.map_viewer.alignment_scale, .01)
+                for key, entry in gui.map_viewer.persp_view.locator_entries().items():
+                    np.testing.assert_array_equal(entry["transform"], before[key]["transform"])
+
+    def test_cancelled_marker_support_cannot_install_late_result(self):
+        gui, observation, truth, _ = self._mapped_gui()
+        measurement = self._mapped_measurement(observation, truth)
+        gui._finish_marker_lineup((gui._marker_request, observation, measurement, ''))
+        job = dict(gui._marker_lock_context, continuous=True)
+        gui._marker_tracking_job = job
+        gui.btn_marker_lineup.setChecked(False)
+        gui._finish_marker_lineup((job, observation, measurement, ''))
+        self.assertIsNone(gui.lidar_matcher.last_marker_measurement)
+        self.assertIsNone(gui._marker_lock_context)
+        np.testing.assert_allclose(gui.lidar_matcher.T_slam_to_map, truth)
+
+    def test_marker_layout_roundtrip_uses_scan_coordinates(self):
+        from unittest.mock import patch
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from marker_map import layout_signature, load_layout
+        gui, _, _, records = self._mapped_gui()
+        gui.btn_marker_lineup.setChecked(False)
+        rigid = np.eye(4)
+        rigid[:3,:3] = rpy_to_matrix(.1,.2,.3)
+        rigid[:3,3] = [3,4,5]
+        gui.map_viewer.T_align = rigid.copy()
+        view = gui.map_viewer.persp_view
+        for key, entry in view.locator_entries().items():
+            view.set_locator_transform(rigid @ entry['transform'], key)
+        with TemporaryDirectory() as folder:
+            path = str(Path(folder)/'markers.json')
+            with patch('dashboard.QFileDialog.getSaveFileName', return_value=(path, '')):
+                gui._save_marker_layout()
+            self.assertEqual(layout_signature(load_layout(path)), layout_signature(records))
+            view.clear_locator_marker()
+            with patch('dashboard.QFileDialog.getOpenFileName', return_value=(path, '')):
+                gui._load_marker_layout()
+            self.assertEqual(layout_signature(gui._mapped_marker_records()), layout_signature(records))
+            self.assertEqual(len(view.locator_entries()), 3)
+
+    def _save_scene(self, gui, path):
+        from unittest.mock import patch
+        with patch('dashboard.QFileDialog.getSaveFileName', return_value=(path, '')):
+            gui._menu_save_scene()
+
+    def _open_scene(self, gui, path):
+        from unittest.mock import patch
+        with patch('dashboard.QFileDialog.getOpenFileName', return_value=(path, '')), \
+                patch('dashboard.QMessageBox.warning') as warning:
+            gui._menu_open_scene()
+        return warning
+
+    @staticmethod
+    def _one_locator():
+        return {"locator": dict(name="Locator", transform=np.eye(4), marker=None)}
+
+    def test_open_scene_restores_what_save_scene_wrote(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        gui, *_ = self._mapped_gui()
+        gui.btn_marker_lineup.setChecked(False)
+        viewer, view = gui.map_viewer, gui.map_viewer.persp_view
+        viewer.set_alignment(1.5, -2., .25, 0., 0., 30., .01)
+        trail = np.eye(4)
+        trail[:3, 3] = [.1, .2, .3]
+        view.set_display_transform("trail", trail)
+        # The tracking origin is whichever Locator is selected; make it not the first.
+        view.outliner_list.setCurrentRow(5)
+        active = view._active_locator_id
+        self.assertNotEqual(active, "locator")
+        before, width = view.locator_entries(), gui.marker_width.value()
+        with TemporaryDirectory() as folder:
+            path = str(Path(folder) / "scene.json")
+            self._save_scene(gui, path)
+            viewer.set_alignment(0, 0, 0, 0, 0, 0, 1.)
+            view.set_display_transform("trail", np.eye(4))
+            view.set_locator_entries(self._one_locator())
+            gui.marker_width.setValue(.05)
+            self._open_scene(gui, path).assert_not_called()
+        self.assertEqual((viewer.tx, viewer.ty, viewer.tz, viewer.yaw), (1.5, -2., .25, 30.))
+        self.assertAlmostEqual(viewer.alignment_scale, .01)
+        np.testing.assert_allclose(view.get_display_transform("trail"), trail, atol=1e-12)
+        after = view.locator_entries()
+        self.assertEqual(list(after), list(before))
+        for key, entry in before.items():
+            self.assertEqual((after[key]["name"], after[key]["marker"]), (entry["name"], entry["marker"]))
+            np.testing.assert_allclose(after[key]["transform"], entry["transform"], atol=1e-9)
+        self.assertEqual(view._active_locator_id, active)
+        np.testing.assert_allclose(gui.engine.anchor_target, before[active]["transform"], atol=1e-9)
+        self.assertAlmostEqual(gui.marker_width.value(), width)
+        self.assertIn("Scene opened", gui.lbl_marker_lineup.text())
+        self.assertNotIn(view.duplicate_locator(), before)
+
+    def test_open_scene_imports_its_scan_first_and_finds_it_beside_the_scene(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from unittest.mock import patch
+        gui, *_ = self._mapped_gui()
+        gui.btn_marker_lineup.setChecked(False)
+        gui.lidar_matcher = None      # the import's own fusion handoff is not under test
+        view = gui.map_viewer.persp_view
+        before = view.locator_entries()
+        with TemporaryDirectory() as folder:
+            scan = str(Path(folder) / "room.ply")
+            Path(scan).write_text("")
+            gui._map_path = "/moved/away/room.ply"
+            path = str(Path(folder) / "scene.json")
+            self._save_scene(gui, path)
+            view.set_locator_entries(self._one_locator())
+            with patch.object(gui, "_on_map_loaded") as load:
+                self._open_scene(gui, path).assert_not_called()
+            load.assert_called_once_with(scan)
+            self.assertEqual(len(view.locator_entries()), 1)        # waits for the scan
+            with patch('dashboard.QMessageBox.warning') as warning:
+                gui._on_import_finished(None, None, None, scan)
+            warning.assert_called_once()
+            self.assertEqual(len(view.locator_entries()), 1)
+            with patch.object(gui, "_on_map_loaded"):
+                self._open_scene(gui, path)
+            gui._on_import_finished(object(), np.random.default_rng(0).random((50, 3)), None, scan)
+        self.assertEqual(list(view.locator_entries()), list(before))
+        self.assertEqual(gui._map_path, scan)
+        self.assertIsNone(gui._pending_scene)
+
+    def test_bad_scene_files_change_nothing(self):
+        import json
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        gui, *_ = self._mapped_gui()
+        gui.btn_marker_lineup.setChecked(False)
+        view = gui.map_viewer.persp_view
+        before = view.locator_entries()
+        with TemporaryDirectory() as folder:
+            path = str(Path(folder) / "scene.json")
+            self._save_scene(gui, path)
+            with open(path) as fh:
+                scene = json.load(fh)
+            marker = dict(dictionary="DICT_4X4_50", id=3, size_m=.1)
+            bad = [dict(format="something.else"),
+                   dict(scene, map_file=str(Path(folder) / "gone.ply")),
+                   dict(scene, locators=[dict(key=k, name=k, transform=np.eye(4).tolist(), marker=marker)
+                                         for k in ("locator", "locator_2")]),
+                   dict(scene, alignment=dict(scene["alignment"], scale=0))]
+            for content in bad:
+                Path(path).write_text(json.dumps(content))
+                self._open_scene(gui, path).assert_called_once()
+                self.assertEqual(list(view.locator_entries()), list(before))
+            # A scene from before Locators were saved: its tracking origin is the one Locator.
+            origin = np.eye(4)
+            origin[:3, 3] = [2., 1., 0.]
+            old = {k: v for k, v in scene.items() if k != "locators"}
+            Path(path).write_text(json.dumps(dict(old, locator=origin.tolist())))
+            self._open_scene(gui, path).assert_not_called()
+        self.assertEqual(list(view.locator_entries()), ["locator"])
+        np.testing.assert_allclose(view.get_locator_transform(), origin, atol=1e-9)
+
+    def test_scan_search_keeps_its_assigned_locator_when_selection_changes(self):
+        from unittest.mock import patch, Mock
+        from lidar_map_matcher import MapMeasurement
+        gui, observation, _, _ = self._mapped_gui()
+        view = gui.map_viewer.persp_view
+        target_id = view._active_locator_id
+        original = view.get_locator_transform('locator')
+        gui.lidar_matcher._map_native = np.ones((10,3))
+        gui._marker_detection_sample = ([(m.family, m.marker_id, m.corners) for m in observation.markers],
+                                        11., time.monotonic(), (848,480))
+        with patch.dict('sys.modules', {'scan_localizer': Mock()}), \
+                patch('dashboard.ScanLocalizeThread') as worker:
+            gui._find_marker_in_scan()
+            worker.return_value.start.assert_called_once()
+        self.assertEqual(gui._find_observation.marker_id, 9)
+        self.assertEqual(gui._find_observation.marker_size_m, .2)
+        self.assertIsNone(gui._marker_lock_context)
+        view.outliner_list.setCurrentRow(4)
+        placed = view.get_locator_transform(target_id)
+        placed[0,3] += .1
+        with patch('dashboard.locator_from_scan', return_value=placed), \
+                patch('dashboard.solve_marker_observation', return_value=MapMeasurement(reason='test rejected scan')) as solve:
+            gui._found_in_scan(dict(ok=True, T_map_optical=np.eye(4), fitness=.9))
+            self.assertFalse(solve.call_args.kwargs['estimate_heading'])
+        np.testing.assert_allclose(view.get_locator_transform('locator'), original)
+        np.testing.assert_allclose(view.get_locator_transform(target_id), placed)
+        self.assertIn('test rejected scan', gui.lbl_marker_lineup.text())
 
     def test_arming_keeps_existing_alignment_and_marks_the_floor_target(self):
         gui, obs, _ = self._marker_gui()
@@ -703,6 +1399,104 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
         gui._poll_marker_lineup()
         self.assertTrue(gui.btn_marker_lineup.isChecked(), 'its own rotation update must not invalidate the lock')
 
+    def test_found_marker_moves_its_locator_and_takes_the_lineup_id(self):
+        from marker_lineup import MarkerMeasurement
+        from marker_map import MarkerSurvey, layout_signature
+        from lidar_map_matcher import MapMeasurement
+        for auto_place in (True, False):
+            with self.subTest(auto_place=auto_place):
+                gui, obs, truth = self._marker_gui()
+                gui._marker_survey = MarkerSurvey() if auto_place else None
+                before = gui.map_viewer.get_locator_transform()
+                found = before.copy()
+                found[:3, :3] = rpy_to_matrix(0, 0, np.radians(143))
+                found[:3, 3] += [.6, -.2, 0]
+                result = MarkerMeasurement(MapMeasurement(ok=True, T_slam_to_map=truth,
+                    observable_rank=3, verify_score=.96), before, .63, found)
+                gui._finish_marker_lineup((gui._marker_request, obs, result, ''))
+                np.testing.assert_allclose(gui.map_viewer.get_locator_transform(), found, atol=1e-12)
+                records = gui._mapped_marker_records()
+                expected = [(obs.family, obs.marker_id, obs.marker_size_m)] if auto_place else []
+                self.assertEqual([(r['dictionary'], r['id'], r['size_m']) for r in records], expected)
+                self.assertEqual(gui._marker_lock_context.get('layout_signature', ()),
+                                 layout_signature(records) if auto_place else ())
+                gui._poll_marker_lineup()
+                self.assertTrue(gui.btn_marker_lineup.isChecked(),
+                                'moving its own Locator must not invalidate the lock')
+                self.assertIsNotNone(gui._marker_lock_context)
+
+    def test_locked_camera_places_markers_nobody_assigned(self):
+        from unittest.mock import patch
+        from marker_lineup import MarkerMeasurement
+        from marker_map import MarkerSurvey, layout_signature
+        from lidar_map_matcher import MapMeasurement
+        from pose_transform import T_BODY_OPTICAL, invert_transform
+        from test_tracking_engine import project_marker
+        gui, obs, truth = self._marker_gui()
+        gui._marker_survey = MarkerSurvey(min_sightings=4)
+        locator = gui.map_viewer.get_locator_transform()
+        gui._finish_marker_lineup((gui._marker_request, obs, MarkerMeasurement(MapMeasurement(
+            ok=True, T_slam_to_map=truth, observable_rank=3, verify_score=.96), locator, 0., locator), ''))
+        view = gui.map_viewer.persp_view
+        # A second, unassigned marker on the same floor, 27 cm from the first.
+        other = locator.copy()
+        other[:3, :3] = rpy_to_matrix(0, 0, 1.1)
+        other[:3, 3] += [.25, .1, 0]
+        to_marker = np.eye(4)
+        to_marker[:3, :3] = rpy_to_matrix(0, 0, -np.pi / 2)
+        camera = truth @ obs.T_slam_image
+        stamp = 10.1
+
+        def show(i):
+            # Orbit the marker: a parked camera leaves both planar PnP branches
+            # steady, and the survey rightly waits for the view to change.
+            nonlocal stamp
+            orbit = np.eye(4)
+            orbit[:3, :3] = rpy_to_matrix(0, 0, np.radians(7 * i))
+            orbit[:3, 3] = other[:3, 3] - orbit[:3, :3] @ other[:3, 3]
+            moved = orbit @ camera
+            stamp += .25
+            slam = invert_transform(truth) @ moved
+            gui.engine.accept_pose(slam[:3, 3], matrix_to_quaternion(slam[:3, :3]),
+                                   [0, 0, 0], [0, 0, 0], stamp=stamp)
+            optical = invert_transform(moved @ T_BODY_OPTICAL) @ other @ to_marker
+            corners = project_marker(obs.K, gui.marker_width.value(), optical)
+            self.assertTrue(np.all(corners > 0) and np.all(corners < (848, 480)))
+            gui._marker_detection_sample = ([(obs.family, obs.marker_id, obs.corners),
+                                             (obs.family, 12, corners)],
+                                            stamp, time.monotonic(), (848, 480))
+            gui._survey_markers()
+
+        def placed():
+            return [e for e in view.locator_entries().values()
+                    if e['marker'] and e['marker']['id'] == 12]
+
+        with patch.object(gui, '_fusion_locked', return_value=True):
+            gui._marker_busy = True      # a support solve in flight holds placement back
+            for i in range(6):
+                show(i)
+            self.assertEqual(placed(), [])
+            gui._marker_busy = False
+            gui._survey_markers()
+        entry, = placed()
+        self.assertLess(np.linalg.norm(entry['transform'][:3, 3] - other[:3, 3]), .01)
+        delta = entry['transform'][:3, :3].T @ other[:3, :3]
+        self.assertLess(np.degrees(np.arccos(np.clip((np.trace(delta) - 1) / 2, -1, 1))), 2.)
+        self.assertEqual(entry['marker']['size_m'], gui.marker_width.value())
+        self.assertEqual(view._active_locator_id, 'locator', 'placing must not take the selection')
+        records = gui._mapped_marker_records()
+        self.assertEqual(sorted(r['id'] for r in records), [obs.marker_id, 12])
+        self.assertEqual(gui._marker_lock_context['layout_signature'], layout_signature(records))
+        self.assertEqual(set(gui._marker_lock_context['oriented_marker_keys']),
+                         {(obs.family, obs.marker_id), (obs.family, 12)})
+        gui._poll_marker_lineup()
+        self.assertTrue(gui.btn_marker_lineup.isChecked())
+        self.assertIsNotNone(gui._marker_lock_context)
+        # Unchecking ends the survey; placed Locators stay for Save marker layout.
+        gui.btn_marker_lineup.setChecked(False)
+        self.assertEqual(gui._marker_survey._tracks, {})
+        self.assertEqual(len(placed()), 1)
+
     def test_scene_edit_invalidates_an_existing_marker_lock(self):
         gui, obs, truth = self._marker_gui()
         self._install_verified_marker(gui, obs, truth)
@@ -772,6 +1566,53 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
             gui._refresh_marker_indicator()
             self.assertEqual(gui.btn_marker_lineup.property("lineupState"), "held")
 
+
+
+class TestDepthPreview(VirtualCameraTestCase):
+    _marker_gui = TestMarkerAssistedLineup._marker_gui
+
+    def test_depth_preview_is_a_separate_default_visible_panel(self):
+        from PyQt5.QtCore import Qt
+        gui, _, _ = self._marker_gui(full_ui=True)
+        self.assertEqual(gui.camera_views.orientation(), Qt.Horizontal)
+        self.assertEqual(gui.camera_views.count(), 2)
+        self.assertIsNot(gui.lbl_track, gui.lbl_depth_preview)
+        self.assertTrue(gui.btn_depth_view.isChecked())
+        self.assertFalse(gui.depth_preview_panel.isHidden())
+        gui.btn_depth_view.setChecked(False)
+        self.assertTrue(gui.depth_preview_panel.isHidden())
+
+    def test_overlay_uses_same_exposure_then_clears_when_stale(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from test_depth_view import K, render, FLOOR, BACK_WALL, SIDE_WALL
+        gui, _, _ = self._marker_gui(full_ui=True)
+        gui.depth_K = K
+        gui.cv_bridge = Mock()
+        gui.cv_bridge.imgmsg_to_cv2.side_effect = lambda msg, encoding: msg.array
+        depth = render([FLOOR, BACK_WALL, SIDE_WALL])
+        gray = np.full(depth.shape, 80, np.uint8)
+
+        def msg(array, ns, frame):
+            return SimpleNamespace(array=array, header=SimpleNamespace(
+                stamp=SimpleNamespace(sec=1, nanosec=ns), frame_id=frame))
+
+        gui.depth_preview_callback(msg(gray, 1, "camera_infra1_optical_frame"))
+        gui._queue_depth_preview("depth", msg(depth, 2, "camera_depth_optical_frame"))
+        gui._refresh_depth_view()
+        self.assertIsNone(gui._depth_cov)
+        self.assertIn("Waiting", gui.lbl_depth_preview.text())
+        gui._queue_depth_preview("depth", msg(depth, 1, "camera_depth_optical_frame"))
+        gui._refresh_depth_view()
+        self.assertEqual(gui._depth_cov.rank, 3)
+        self.assertFalse(gui.lbl_depth_preview.pixmap().isNull())
+        self.assertIn("scan agreement", gui.lbl_depth_readiness.text())
+        self.assertTrue(gui.lbl_track.pixmap() is None or gui.lbl_track.pixmap().isNull())
+        sample = gui._depth_preview_sample
+        gui._depth_preview_sample = (sample[0], sample[1], time.monotonic() - 1)
+        gui._refresh_depth_view()
+        self.assertIsNone(gui._depth_cov)
+        self.assertIn("unavailable", gui.lbl_depth_readiness.text())
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

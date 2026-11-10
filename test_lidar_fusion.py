@@ -837,6 +837,33 @@ class TestSyntheticRoomICP(unittest.TestCase):
         corrected = live.T_slam_to_map @ slam_map @ moved
         self.assertLess(np.linalg.norm(corrected[:3, 3] - moved[:3, 3]), 0.03)
 
+    def test_multiple_surveyed_markers_verify_against_real_room_depth(self):
+        from dataclasses import replace
+        from marker_map import MappedObservation, solve_mapped_observation
+        from pose_transform import invert_transform
+        from test_tracking_engine import project_marker
+        observation, camera, slam_map, locator = self._unknown_heading_observation()
+        markers = []
+        for i, offset in enumerate((-.35, .35)):
+            target = locator.copy()
+            target[:3,3] += offset * camera[:3,1]
+            optical = invert_transform(camera @ T_BODY_OPTICAL) @ target @ rigid(rpy_deg=(0,0,-90))
+            markers.append(replace(observation, marker_id=7+i, marker_size_m=.2,
+                T_map_locator=target, corners=project_marker(self.K, .2, optical)))
+        matcher = self._matcher()
+        result = solve_mapped_observation(MappedObservation(tuple(markers)), matcher)
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(len(result.marker_keys), 2)
+        self.assertGreater(result.verify_score, .75)
+        np.testing.assert_allclose(result.T_slam_to_map, invert_transform(slam_map), atol=1e-5)
+        self.assertFalse(matcher.is_aligned, 'verification must not install its result')
+        # Shift off the observed floor: depth must veto the wrong survey height.
+        for marker in markers:
+            marker.T_map_locator[2,3] += 1.
+        result = solve_mapped_observation(MappedObservation(tuple(markers)), matcher)
+        self.assertFalse(result.ok)
+        self.assertIn('scan verification', result.reason)
+
     def _unknown_heading_observation(self, heading=137, symmetric=False):
         from marker_lineup import MarkerObservation
         from pose_transform import invert_transform
@@ -873,6 +900,36 @@ class TestSyntheticRoomICP(unittest.TestCase):
                 delta = result.T_map_locator[:3, :3].T @ locator[:3, :3]
                 self.assertLess(np.degrees(np.arccos(np.clip((np.trace(delta)-1)/2,-1,1))), 1.)
 
+    def test_wall_marker_is_found_upright_on_its_wall(self):
+        """A marker taped to a wall: face level, printed top up, heading unknown."""
+        from marker_lineup import MarkerObservation, solve_marker_observation
+        from pose_transform import invert_transform
+        from test_tracking_engine import project_marker
+        import time
+        camera = rigid(rpy_deg=(0, 25, 62), t=(.8, 1.2, 1.4))
+        fwd = camera[:3, 0]
+        centre = camera[:3, 3] + fwd * ((2.5 - camera[1, 3]) / fwd[1])   # on the y = 2.5 wall
+        wall = np.eye(4)
+        wall[:3, :3] = np.column_stack(([0, 0, 1.], [-1, 0, 0.], [0, -1, 0.]))  # top up, face into the room
+        wall[:3, 3] = centre
+        optical = invert_transform(camera @ T_BODY_OPTICAL) @ wall @ rigid(rpy_deg=(0, 0, -90))
+        corners = project_marker(self.K, .1, optical)
+        self.assertTrue(np.all(corners > 0) and np.all(corners < (640, 360)))
+        slam_map = rigid(rpy_deg=(0, 0, 43), t=(2.4, -1.3, .4))   # gravity-aligned SLAM
+        for offset in ((0, 0, 0), (.45, -.3, 0)):
+            with self.subTest(offset=offset):
+                obs = MarkerObservation('DICT_4X4_250', 5, corners, self.K, .1,
+                    slam_map @ camera, slam_map @ camera, rigid(t=centre + offset),
+                    self._render_depth(camera), self.K, np.array([0., 0., 1.]), time.monotonic())
+                m = self._matcher(hint_radius_m=.5, hint_radius_deg=20)
+                result = solve_marker_observation(obs, m, search_radius_m=1.)
+                self.assertTrue(result.ok, result.reason)
+                distance, angle = m._camera_delta(np.linalg.inv(slam_map), result.T_slam_to_map, obs.T_slam_image)
+                self.assertLess(distance, .03)
+                self.assertLess(angle, 1.)
+                self.assertLess(np.linalg.norm(result.T_map_marker[:3, 3] - centre), .03)
+                np.testing.assert_allclose(result.T_map_marker[:3, :3], wall[:3, :3], atol=.02)
+
     def test_symmetric_room_does_not_invent_a_marker_heading(self):
         from marker_lineup import solve_marker_observation
         obs, _, _, _ = self._unknown_heading_observation(symmetric=True)
@@ -887,9 +944,30 @@ class TestSyntheticRoomICP(unittest.TestCase):
         obs, _, _, _ = self._unknown_heading_observation()
         obs.T_map_locator[0, 3] += 10.
         m = self._matcher(hint_radius_m=.5, hint_radius_deg=20)
-        result = solve_marker_observation(obs, m)
-        self.assertFalse(result.ok)
+        for radius in (None, 1.):
+            result = solve_marker_observation(obs, m, search_radius_m=radius)
+            self.assertFalse(result.ok)
         self.assertFalse(m.is_aligned)
+
+    def test_wider_search_finds_a_marker_away_from_the_locator(self):
+        from marker_lineup import solve_marker_observation
+        obs, camera, slam_map, locator = self._unknown_heading_observation(137)
+        placed = obs.T_map_locator[:3, 3].copy()
+        obs.T_map_locator[:3, 3] += [.55, -.45, 0]   # 0.71 m off, between grid points
+        m = self._matcher(hint_radius_m=.5, hint_radius_deg=20)
+        self.assertFalse(solve_marker_observation(obs, m).ok,
+                         "the default radius is lidar.hint_radius_m")
+        result = solve_marker_observation(obs, m, search_radius_m=1.)
+        self.assertTrue(result.ok, result.reason)
+        self.assertFalse(m.is_aligned, 'search must wait for GUI context validation')
+        distance, angle = m._camera_delta(np.linalg.inv(slam_map), result.T_slam_to_map, obs.T_slam_image)
+        self.assertLess(distance, .03)
+        self.assertLess(angle, 1.)
+        self.assertLess(np.linalg.norm(result.T_map_marker[:3, 3] - placed), .03)
+        delta = result.T_map_marker[:3, :3].T @ locator[:3, :3]
+        self.assertLess(np.degrees(np.arccos(np.clip((np.trace(delta)-1)/2,-1,1))), 1.)
+        self.assertAlmostEqual(result.marker_error_m, .71, delta=.03)
+        np.testing.assert_allclose(result.T_map_locator[:3, 3], obs.T_map_locator[:3, 3])
 
     def test_solve_from_hint_ignores_where_the_hint_actually_was(self):
         """The reported symptom: the camera must not land on the locator."""

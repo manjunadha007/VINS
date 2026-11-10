@@ -1,7 +1,6 @@
 """
 MapViewerWidget — 3DEqualizer-style viewport editor for LiDAR alignment.
-2D views (Top/Side) and overlays use pure QPainter. The 3D perspective
-viewport renders the imported mesh with real OpenGL (depth-buffered, GPU
+Overlays use pure QPainter. The 3D perspective viewport renders the imported mesh with real OpenGL (depth-buffered, GPU
 rasterized) so every polygon draws every frame regardless of view angle or
 mesh density -- QPainter has no z-buffer and can't do this correctly for
 dense, concave scanned geometry. Grid/trail/HUD overlays stay QPainter,
@@ -20,12 +19,12 @@ from OpenGL.raw.GL.VERSION.GL_2_0 import glVertexAttribPointer as _raw_vertex_at
 from PyQt5.QtWidgets import (
     QWidget, QOpenGLWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton,
-    QSplitter, QSizePolicy, QFileDialog, QListWidget,
+    QSizePolicy, QFileDialog, QListWidget,
     QDoubleSpinBox, QGridLayout, QScrollArea
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPointF, QRectF, QLineF
 from PyQt5.QtGui import (QImage, QPixmap, QPainter, QColor, QPen, QBrush,
-                          QFont, QPolygonF, QCursor, QSurfaceFormat, QOpenGLContext)
+                          QFont, QCursor, QSurfaceFormat, QOpenGLContext)
 
 # Give every QOpenGLWidget in this app a real depth buffer. Must be set
 # before the first QOpenGLWidget's native window is created; setting it at
@@ -88,171 +87,6 @@ void main() {
 # ─────────────────────────────────────────────────
 # Pure QPainter viewport widgets (no pyqtgraph)
 # ─────────────────────────────────────────────────
-
-class OrthoView(QWidget):
-    """2D orthographic view (Top or Side) with grid, point cloud, trail, camera dot.
-
-    Axes follow Unreal Engine convention:
-        X = forward (red), Y = right (green), Z = up (blue).
-    """
-
-    def __init__(self, title="View", axis_h="X", axis_v="Y",
-                 color_h='#ff3333', color_v='#33ff33'):
-        super().__init__()
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumSize(100, 80)
-        self._title = title
-        self._ax_h, self._ax_v = axis_h, axis_v
-        self._color_h, self._color_v = color_h, color_v
-        self._pts = None       # Nx2
-        self._trail = []       # list of (h, v)
-        self._cam = None       # (h, v)
-        self._locator = None   # (h, v) -- tracking-origin marker, situational only
-        self._lock = threading.Lock()
-        # View transform
-        self._center = np.array([0., 0.])
-        self._scale = 200.0  # 200 pixels per metre — a 2.5 m room fills 500 px
-        self._drag_start = None
-
-    def set_points(self, h_arr, v_arr):
-        with self._lock:
-            self._pts = list(zip(h_arr, v_arr))
-        self.update()
-
-    def set_trail(self, h_arr, v_arr):
-        with self._lock:
-            self._trail = list(zip(h_arr, v_arr))
-        self.update()
-
-    def set_cam(self, h, v):
-        with self._lock:
-            self._cam = (h, v)
-        self.update()
-
-    def set_locator(self, h, v):
-        with self._lock:
-            self._locator = (h, v)
-        self.update()
-
-    def _world_to_screen(self, wh, wv):
-        W, H = self.width(), self.height()
-        sx = W / 2 + (wh - self._center[0]) * self._scale
-        sy = H / 2 - (wv - self._center[1]) * self._scale
-        return sx, sy
-
-    def _world_to_screen_arr(self, pts):
-        """`_world_to_screen` over an (N, 2) array. Same maths, one pass --
-        the trail is up to TRAIL_MAX points and this runs twice a frame
-        (Top and Side) on the GUI thread."""
-        W, H = self.width(), self.height()
-        pts = np.asarray(pts, dtype=float).reshape(-1, 2)
-        out = np.empty_like(pts)
-        out[:, 0] = W / 2 + (pts[:, 0] - self._center[0]) * self._scale
-        out[:, 1] = H / 2 - (pts[:, 1] - self._center[1]) * self._scale
-        return out
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        W, H = self.width(), self.height()
-        p.fillRect(0, 0, W, H, QColor('#111122'))
-
-        # Grid
-        p.setPen(QPen(QColor('#1a1a2e'), 1))
-        grid_step = max(1.0, 10 ** math.floor(math.log10(max(W, H) / self._scale / 5 + 0.01)))
-        cx, cy = self._center
-        for i in range(-50, 51):
-            gw = round(cx / grid_step) * grid_step + i * grid_step
-            sx, _ = self._world_to_screen(gw, 0)
-            if 0 <= sx <= W:
-                col = QColor('#333355') if abs(gw) < grid_step * 0.01 else QColor('#1a1a2e')
-                p.setPen(QPen(col, 1 if abs(gw) > grid_step * 0.01 else 2))
-                p.drawLine(int(sx), 0, int(sx), H)
-            _, sy = self._world_to_screen(0, gw)
-            if 0 <= sy <= H:
-                col = QColor('#333355') if abs(gw) < grid_step * 0.01 else QColor('#1a1a2e')
-                p.setPen(QPen(col, 1 if abs(gw) > grid_step * 0.01 else 2))
-                p.drawLine(0, int(sy), W, int(sy))
-
-        with self._lock:
-            pts = self._pts
-            trail = list(self._trail)
-            cam = self._cam
-            locator = self._locator
-
-        # Points
-        if pts is not None and len(pts) > 0:
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(QColor(100, 180, 255, 80)))
-            scr = self._world_to_screen_arr(pts[::max(1, len(pts) // 5000)])
-            on = ((scr[:, 0] >= 0) & (scr[:, 0] <= W) &
-                  (scr[:, 1] >= 0) & (scr[:, 1] <= H))
-            for sx, sy in scr[on]:
-                p.drawEllipse(QPointF(sx, sy), 1.5, 1.5)
-
-        # Trail
-        if len(trail) > 1:
-            scr = self._world_to_screen_arr(trail)
-            p.setPen(QPen(QColor('#ff6600'), 1.5))
-            p.drawLines([QLineF(scr[i - 1, 0], scr[i - 1, 1],
-                                scr[i, 0], scr[i, 1])
-                         for i in range(1, len(scr))])
-
-        # Locator (tracking origin) -- small diamond, situational only
-        if locator is not None:
-            sx, sy = self._world_to_screen(*locator)
-            p.setPen(QPen(QColor('#ffcc00'), 2))
-            p.setBrush(QBrush(QColor(255, 204, 0, 90)))
-            diamond = QPolygonF([QPointF(sx, sy - 7), QPointF(sx + 7, sy),
-                                 QPointF(sx, sy + 7), QPointF(sx - 7, sy)])
-            p.drawPolygon(diamond)
-
-        # Camera dot
-        if cam is not None:
-            sx, sy = self._world_to_screen(*cam)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(QColor(255, 50, 50, 60)))
-            p.drawEllipse(QPointF(sx, sy), 12, 12)
-            p.setBrush(QBrush(QColor('#ff4444')))
-            p.drawEllipse(QPointF(sx, sy), 6, 6)
-
-        # Title + axis labels in Unreal colours
-        p.setFont(QFont('Arial', 9, QFont.Bold))
-        p.setPen(QColor('#00d4ff'))
-        p.drawText(6, 16, f"{self._title}  ")
-        fm = p.fontMetrics()
-        x_off = 6 + fm.horizontalAdvance(f"{self._title}  ")
-        p.setPen(QColor(self._color_h))
-        p.drawText(x_off, 16, f"{self._ax_h}→  ")
-        x_off += fm.horizontalAdvance(f"{self._ax_h}→  ")
-        p.setPen(QColor(self._color_v))
-        p.drawText(x_off, 16, f"{self._ax_v}↑")
-        p.end()
-
-    def wheelEvent(self, e):
-        delta = e.angleDelta().y()
-        self._scale *= 1.15 if delta > 0 else 0.87
-        # Allow scale to get very small so we can zoom out infinitely (e.g. 0.01 pixels per meter)
-        self._scale = max(0.001, min(100000.0, self._scale))
-        self.update()
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MiddleButton:
-            self._drag_start = e.pos()
-
-    def mouseMoveEvent(self, e):
-        if self._drag_start and e.buttons() & Qt.MiddleButton:
-            dx = e.pos().x() - self._drag_start.x()
-            dy = e.pos().y() - self._drag_start.y()
-            self._center[0] -= dx / self._scale
-            self._center[1] += dy / self._scale
-            self._drag_start = e.pos()
-            self.update()
-
-    def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MiddleButton:
-            self._drag_start = None
-
 
 class _VerticalGrip(QWidget):
     """A drag handle that resizes the overlay panel it sits at the bottom of.
@@ -441,6 +275,9 @@ class PerspView(QOpenGLWidget):
         # yaw, which is all the translate-only gizmo could produce.
         self._locator_rpy = np.zeros(3)
         self._locator_marker_size = None
+        self._active_locator_id = "locator"
+        self._locators = {"locator": dict(name="Locator", transform=np.eye(4), marker=None)}
+        self._locator_counter = 1
         self._camera_edit_locked = False
         self._active_gizmo = None   # None|x|y|z|plane_xy|rot_x|rot_y|rot_z
         self._gizmo_drag_screen0 = None
@@ -543,6 +380,7 @@ class PerspView(QOpenGLWidget):
         self.outliner_list.setMaximumHeight(110)
         self.outliner_list.addItems(["Camera", "Point Cloud", "Trail",
                                      "World Origin", "Locator (Tracking Origin)"])
+        self.outliner_list.item(4).setData(Qt.UserRole, "locator")
         # Connect *before* choosing the default row, so the handler actually
         # runs and `_gizmo_target` agrees with what is highlighted. The other
         # order left the list showing "Camera" while the gizmo was still the
@@ -551,6 +389,55 @@ class PerspView(QOpenGLWidget):
         self.outliner_list.currentRowChanged.connect(self._on_outliner_selection_changed)
         self._select_gizmo_row('locator')
         lay.addWidget(self.outliner_list)
+
+        locator_buttons = QHBoxLayout()
+        self.btn_duplicate_locator = QPushButton("Duplicate Locator")
+        self.btn_duplicate_locator.clicked.connect(self.duplicate_locator)
+        locator_buttons.addWidget(self.btn_duplicate_locator)
+        self.btn_remove_locator = QPushButton("Remove")
+        self.btn_remove_locator.clicked.connect(self.remove_locator)
+        locator_buttons.addWidget(self.btn_remove_locator)
+        lay.addLayout(locator_buttons)
+        from PyQt5.QtWidgets import QComboBox
+        self.detected_marker = QComboBox()
+        self.detected_marker.addItem("Show a marker in the live camera", None)
+        self.detected_marker.setToolTip("Select the detected ID to assign to the selected Locator.")
+        lay.addWidget(self.detected_marker)
+        assignment = QHBoxLayout()
+        self.locator_width = QDoubleSpinBox()
+        self.locator_width.setRange(.005, 5.)
+        self.locator_width.setDecimals(4)
+        self.locator_width.setValue(.1)
+        self.locator_width.setSuffix(" m")
+        self.locator_width.setToolTip("Measured printed square width, excluding paper margin.")
+        assignment.addWidget(self.locator_width)
+        self.btn_assign_marker = QPushButton("Assign ID")
+        self.btn_assign_marker.clicked.connect(self._assign_detected_marker)
+        assignment.addWidget(self.btn_assign_marker)
+        self.btn_clear_marker = QPushButton("Clear ID")
+        self.btn_clear_marker.clicked.connect(self.clear_locator_marker)
+        assignment.addWidget(self.btn_clear_marker)
+        lay.addLayout(assignment)
+        self.locator_assignment_status = QLabel("+X: printed top. +Z: out of marker face.")
+        self.locator_assignment_status.setWordWrap(True)
+        self.locator_assignment_status.setStyleSheet(
+            "color:#aebfd2;font-size:10px;border:none;background:transparent;")
+        lay.addWidget(self.locator_assignment_status)
+        for button in (self.btn_duplicate_locator, self.btn_remove_locator,
+                       self.btn_assign_marker, self.btn_clear_marker):
+            button.setStyleSheet(
+                "QPushButton {color:#dce7f4;background:#233547;border:1px solid #3e586d;"
+                "border-radius:3px;padding:4px;font-size:10px;}"
+                "QPushButton:hover {background:#304a61;}")
+            button.setCursor(Qt.PointingHandCursor)
+        self.detected_marker.setStyleSheet(
+            "QComboBox {color:#dce7f4;background:#172431;border:1px solid #3e586d;"
+            "padding:4px;font-size:10px;}"
+            "QComboBox QAbstractItemView {color:#dce7f4;background:#172431;"
+            "selection-background-color:#303f9f;}")
+        self.locator_width.setStyleSheet(
+            "QDoubleSpinBox {color:#dce7f4;background:#172431;border:1px solid #3e586d;"
+            "padding:3px;font-size:10px;}")
 
         self.btn_gizmo = QPushButton("✥ Gizmo: ON")
         self.btn_gizmo.setCheckable(True)
@@ -680,6 +567,8 @@ class PerspView(QOpenGLWidget):
         if spec is None:
             return
         for row in range(self.outliner_list.count()):
+            if target == 'locator' and self.outliner_list.item(row).data(Qt.UserRole) != self._active_locator_id:
+                continue
             if self.outliner_list.item(row).text().startswith(spec['prefix']):
                 if self.outliner_list.currentRow() != row:
                     self.outliner_list.setCurrentRow(row)
@@ -695,6 +584,17 @@ class PerspView(QOpenGLWidget):
 
     def _on_outliner_selection_changed(self, row):
         item = self.outliner_list.item(row)
+        if item is not None and item.data(Qt.UserRole) in self._locators:
+            self._locators[self._active_locator_id]["transform"] = self.get_locator_transform()
+            self._active_locator_id = item.data(Qt.UserRole)
+            self.set_locator_transform(self._locators[self._active_locator_id]["transform"])
+            marker = self._locators[self._active_locator_id]["marker"]
+            self._locator_marker_size = marker["size_m"] if marker else None
+            if marker and hasattr(self, "locator_width"):
+                self.locator_width.setValue(marker["size_m"])
+            if hasattr(self, "locator_assignment_status"):
+                assigned = f"{marker['dictionary']} / ID {marker['id']}" if marker else "Unassigned"
+                self.locator_assignment_status.setText(assigned + " · +X: printed top; +Z: out of face.")
         name = item.text() if item else ""
         self._gizmo_target = None
         for key, spec in self.GIZMO_TARGETS.items():
@@ -780,6 +680,20 @@ class PerspView(QOpenGLWidget):
         T[:3, 3] = getattr(self, "_" + target + "_pos")
         return T
 
+    def set_display_transform(self, target, T):
+        """Set the trail or reference-grid transform in code (File > Open Scene)."""
+        if target not in ("trail", "world"):
+            raise ValueError("Display transform must be trail or world")
+        from pose_transform import matrix_to_rpy
+        T = np.asarray(T, dtype=float)
+        setattr(self, "_" + target + "_pos", T[:3, 3].copy())
+        setattr(self, "_" + target + "_rpy",
+                np.degrees(np.asarray(matrix_to_rpy(T[:3, :3]), dtype=float)))
+        if target == "trail":
+            self.trail_changed.emit()
+        self._sync_channels(force=True)
+        self.update()
+
     def display_points(self, target, points):
         T = self.get_display_transform(target)
         points = np.asarray(points, dtype=float).reshape(-1, 3)
@@ -856,6 +770,24 @@ class PerspView(QOpenGLWidget):
         self.update()
 
     def _draw_marker_target(self, painter, basis):
+        # All assigned locators stay visible; only the selected one has a gizmo.
+        for key, entry in self.locator_entries().items():
+            if key == self._active_locator_id:
+                continue
+            T = entry["transform"]
+            marker = entry["marker"]
+            s = (marker["size_m"] if marker else .1) / 2
+            local = np.array([[-s,-s,0], [s,-s,0], [s,s,0], [-s,s,0], [-s,-s,0]])
+            points = local @ T[:3,:3].T + T[:3,3]
+            painter.setPen(QPen(QColor("#c4a86c"), 2))
+            for a, b in zip(points[:-1], points[1:]):
+                screen = self._project_segment(a, b, basis)
+                if screen is not None:
+                    painter.drawLine(QPointF(*screen[0]), QPointF(*screen[1]))
+            screen, visible = self._project_pts(T[:3,3].reshape(1,3), basis)
+            if visible[0]:
+                label = entry["name"] + (f" · ID {marker['id']}" if marker else " · unassigned")
+                painter.drawText(QPointF(*screen[0]) + QPointF(5,-5), label)
         if self._locator_marker_size is None:
             return
         s = self._locator_marker_size / 2
@@ -872,10 +804,14 @@ class PerspView(QOpenGLWidget):
         screen, visible = self._project_pts(points[5:6], basis)
         if visible[0]:
             painter.setFont(QFont("DejaVu Sans", 9))
-            painter.drawText(QPointF(*screen[0]) + QPointF(5, -5), "MARKER TOP (+X)")
+            marker = self._locators[self._active_locator_id]["marker"]
+            label = (f"ID {marker['id']} · " if marker else "") + "MARKER TOP (+X)"
+            painter.drawText(QPointF(*screen[0]) + QPointF(5, -5), label)
 
-    def get_locator_transform(self):
+    def get_locator_transform(self, locator_id=None):
         """4x4 in the same world/ROS frame as the marker solve and camera dot."""
+        if locator_id is not None and locator_id != self._active_locator_id:
+            return self._locators[locator_id]["transform"].copy()
         from pose_transform import rpy_to_matrix
         T = np.eye(4)
         r, pi, y = np.radians(self._locator_rpy)
@@ -883,7 +819,169 @@ class PerspView(QOpenGLWidget):
         T[:3, 3] = self._locator_pos
         return T
 
-    def set_locator_transform(self, T):
+    def locator_entries(self):
+        """Independent poses and assignments, including edits in the channel box."""
+        return {key: dict(name=entry["name"], transform=self.get_locator_transform(key),
+                          marker=None if entry["marker"] is None else dict(entry["marker"]))
+                for key, entry in self._locators.items()}
+
+    def set_locator_entries(self, entries, active=None):
+        """Replace every Locator with saved ones (File > Open Scene).
+
+        `entries` is shaped like `locator_entries()`; `active` is the one to
+        select, and so the anchor target, the first by default. The outliner
+        is rebuilt with its signals held: the selection handler writes the
+        old selection's pose into its entry, which would overwrite whichever
+        restored Locator shares that key.
+        """
+        from PyQt5.QtWidgets import QListWidgetItem
+        from marker_map import MAX_MARKERS
+        if not 1 <= len(entries) <= MAX_MARKERS:
+            raise ValueError(f"A scene holds 1 to {MAX_MARKERS} Locators.")
+        active = active if active in entries else next(iter(entries))
+        was = self.outliner_list.blockSignals(True)
+        try:
+            for row in reversed(range(self.outliner_list.count())):
+                if self.outliner_list.item(row).data(Qt.UserRole) in self._locators:
+                    self.outliner_list.takeItem(row)
+            self._locators = {
+                key: dict(name=entry["name"], transform=np.asarray(entry["transform"], dtype=float).copy(),
+                          marker=None if entry["marker"] is None else dict(entry["marker"]))
+                for key, entry in entries.items()}
+            # Duplicates are numbered on from here, so none reuses a key.
+            numbers = [int(key.rsplit("_", 1)[-1]) for key in self._locators
+                       if key.rsplit("_", 1)[-1].isdigit()]
+            self._locator_counter = max([len(self._locators), *numbers])
+            for key, entry in self._locators.items():
+                marker = entry["marker"]
+                text = (f"{entry['name']} · ID {marker['id']}" if marker
+                        else "Locator (Tracking Origin)" if key == "locator"
+                        else entry["name"] + " · unassigned")
+                item = QListWidgetItem(text)
+                item.setData(Qt.UserRole, key)
+                self.outliner_list.addItem(item)
+                if key == active:
+                    row = self.outliner_list.count() - 1
+            self._active_locator_id = active
+            self.set_locator_transform(self._locators[active]["transform"])
+            self.outliner_list.setCurrentRow(row)
+        finally:
+            self.outliner_list.blockSignals(was)
+        self._on_outliner_selection_changed(row)
+
+    def duplicate_locator(self):
+        from marker_map import MAX_MARKERS
+        if self._gizmo_target != 'locator' or len(self._locators) >= MAX_MARKERS:
+            self.locator_assignment_status.setText(f"Select a Locator to duplicate (up to {MAX_MARKERS}).")
+            return None
+        from PyQt5.QtWidgets import QListWidgetItem
+        self._locator_counter += 1
+        key = f"locator_{self._locator_counter}"
+        self._locators[key] = dict(name=f"Locator {self._locator_counter}",
+                                  transform=self.get_locator_transform(), marker=None)
+        item = QListWidgetItem(self._locators[key]["name"] + " · unassigned")
+        item.setData(Qt.UserRole, key)
+        self.outliner_list.addItem(item)
+        self.outliner_list.setCurrentItem(item)
+        self.locator_assignment_status.setText("Move this duplicate to its marker, then assign a unique ID.")
+        return key
+
+    def add_marker_locator(self, T, family, fid, size_m):
+        """A new Locator for an automatically placed marker; the selection stays put."""
+        from PyQt5.QtWidgets import QListWidgetItem
+        from marker_map import MAX_MARKERS
+        if len(self._locators) >= MAX_MARKERS:
+            raise ValueError(f"Already {MAX_MARKERS} Locators.")
+        self._locator_counter += 1
+        key = f"locator_{self._locator_counter}"
+        self._locators[key] = dict(name=f"Locator {self._locator_counter}",
+                                   transform=np.asarray(T, dtype=float).copy(), marker=None)
+        item = QListWidgetItem(self._locators[key]["name"])
+        item.setData(Qt.UserRole, key)
+        self.outliner_list.addItem(item)
+        try:
+            self.assign_marker_to_locator(key, family, fid, size_m)
+        except ValueError:
+            del self._locators[key]
+            self.outliner_list.takeItem(self.outliner_list.row(item))
+            raise
+        return key
+
+    def assign_marker_to_locator(self, key, family, fid, size_m):
+        """Assign an ID to one Locator, selected or not."""
+        if any(k != key and e["marker"] is not None
+               and (e["marker"]["dictionary"], e["marker"]["id"]) == (family, fid)
+               for k, e in self._locators.items()):
+            raise ValueError(f"ID {fid} already belongs to another Locator.")
+        from marker_map import validate_layout
+        validate_layout([dict(dictionary=family, id=fid, size_m=size_m,
+                              position_m=[0,0,0], rotation_deg=[0,0,0])])
+        entry = self._locators[key]
+        entry["marker"] = dict(dictionary=family, id=fid, size_m=float(size_m))
+        for i in range(self.outliner_list.count()):
+            item = self.outliner_list.item(i)
+            if item.data(Qt.UserRole) == key:
+                item.setText(f"{entry['name']} · ID {fid}")
+        if key == self._active_locator_id:
+            self.locator_width.setValue(size_m)
+            self.set_locator_marker_size(size_m)
+        self.update()
+
+    def remove_locator(self):
+        if self._gizmo_target != 'locator' or len(self._locators) <= 1:
+            return
+        key = self._active_locator_id
+        row = self.outliner_list.currentRow()
+        # Select the survivor while the old transform is still available.
+        survivor = next(k for k in self._locators if k != key)
+        for i in range(self.outliner_list.count()):
+            if self.outliner_list.item(i).data(Qt.UserRole) == survivor:
+                self.outliner_list.setCurrentRow(i)
+                break
+        del self._locators[key]
+        self.outliner_list.takeItem(row)
+        self.update()
+
+    def set_detected_markers(self, detections):
+        keys = sorted({(family, int(fid)) for family, fid, _ in detections})
+        if keys == getattr(self, "_detected_marker_keys", None):
+            return
+        self._detected_marker_keys = keys
+        current = self.detected_marker.currentData()
+        self.detected_marker.clear()
+        self.detected_marker.addItem("Select detected marker" if keys else "No markers visible", None)
+        for family, fid in keys:
+            self.detected_marker.addItem(f"{family} · ID {fid}", (family, fid))
+        index = self.detected_marker.findData(current) if current is not None else -1
+        self.detected_marker.setCurrentIndex(index if index >= 0 else (1 if len(keys) == 1 else 0))
+
+    def assign_locator_marker(self, family, fid, size_m):
+        if self._gizmo_target != 'locator':
+            raise ValueError("Select a Locator in the outliner first.")
+        self.assign_marker_to_locator(self._active_locator_id, family, fid, size_m)
+        entry = self._locators[self._active_locator_id]
+        self.locator_assignment_status.setText(f"{entry['name']} assigned to {family} / ID {fid}.")
+
+    def _assign_detected_marker(self):
+        key = self.detected_marker.currentData()
+        if key is None:
+            self.locator_assignment_status.setText("Choose an ID detected in the live camera.")
+            return
+        try:
+            self.assign_locator_marker(*key, self.locator_width.value())
+        except ValueError as exc:
+            self.locator_assignment_status.setText(str(exc))
+
+    def clear_locator_marker(self):
+        if self._gizmo_target != 'locator':
+            return
+        entry = self._locators[self._active_locator_id]
+        entry["marker"] = None
+        self.outliner_list.currentItem().setText(entry["name"] + " · unassigned")
+        self.set_locator_marker_size(None)
+        self.locator_assignment_status.setText("Unassigned · +X: printed top; +Z: out of face.")
+
+    def set_locator_transform(self, T, locator_id=None):
         """Set the locator from a 4x4, orientation included.
 
         Roll and pitch used to be discarded here (only the heading survived),
@@ -893,6 +991,10 @@ class PerspView(QOpenGLWidget):
         """
         from pose_transform import matrix_to_rpy
         T = np.asarray(T, dtype=float)
+        if locator_id is not None and locator_id != self._active_locator_id:
+            self._locators[locator_id]["transform"] = T.copy()
+            self.update()
+            return
         self._locator_pos = T[:3, 3].copy()
         self._locator_rpy = np.degrees(np.asarray(matrix_to_rpy(T[:3, :3]),
                                                   dtype=float))
@@ -1926,16 +2028,16 @@ class MapViewerWidget(QWidget):
     delete_requested = pyqtSignal()            # operator asked to delete the scan
     TRAIL_MAX = 2000
 
-    #: Rate at which camera pose is pushed into the three views. Every push
-    #: repaints all of them, and each repaint costs milliseconds of GUI
-    #: thread. The UI timer runs at 60 Hz because the FreeD stream needs
-    #: that cadence -- a monitoring viewport does not, and painting three
-    #: views 60 times a second is most of what saturated the GUI thread and
-    #: left the dashboard unable to answer the window manager.
+    #: Rate at which camera pose is pushed into the 3D view. Every push
+    #: repaints it, and each repaint costs milliseconds of GUI thread. The
+    #: UI timer runs at 60 Hz because the FreeD stream needs that cadence --
+    #: a monitoring viewport does not, and painting views 60 times a second
+    #: is most of what saturated the GUI thread and left the dashboard unable
+    #: to answer the window manager.
     VIEW_REFRESH_HZ = 30
 
     #: A pose closer than this to the last trail point adds nothing to look
-    #: at but costs a segment in three views on every frame afterwards. Held
+    #: at but costs a segment on every frame afterwards. Held
     #: still, the camera otherwise fills all TRAIL_MAX points with the same
     #: position -- 2000 segments drawn on top of each other.
     TRAIL_MIN_STEP_M = 0.002
@@ -1973,21 +2075,12 @@ class MapViewerWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(2)
 
-        _ss = "QSplitter::handle{background:#555566;} QSplitter{background:#0d0d1a;}"
-
-        # Views — Unreal axis convention: X=fwd(red), Y=right(green), Z=up(blue)
-        self.top_view = OrthoView("TOP (XY)", "X", "Y",
-                                  color_h='#ff3333', color_v='#33ff33')
-        self.side_view = OrthoView("FRONT (XZ)", "X", "Z",
-                                   color_h='#ff3333', color_v='#3333ff')
         self.persp_view = PerspView()
         self.persp_view.locator_changed.connect(self._on_persp_locator_changed)
         self.persp_view.camera_moved.connect(self._on_persp_camera_moved)
         self.persp_view.mesh_moved.connect(self._on_persp_mesh_moved)
         self.persp_view.trail_changed.connect(self._push_trail)
         self.persp_view.delete_requested.connect(self.delete_requested)
-        self.top_view.set_locator(0.0, 0.0)
-        self.side_view.set_locator(0.0, 0.0)
 
         # Overlay toggle
         bot = QHBoxLayout()
@@ -1998,24 +2091,8 @@ class MapViewerWidget(QWidget):
         bot.addWidget(self.btn_overlay)
         bot.addStretch()
 
-        persp_w = QWidget()
-        persp_lay = QVBoxLayout(persp_w)
-        persp_lay.setContentsMargins(0,0,0,0); persp_lay.setSpacing(0)
-        persp_lay.addWidget(self.persp_view, stretch=1)
-        persp_lay.addLayout(bot)
-
-        self.h_split = QSplitter(Qt.Horizontal)
-        self.h_split.setHandleWidth(5); self.h_split.setStyleSheet(_ss)
-        self.h_split.addWidget(self.top_view)
-        self.h_split.addWidget(self.side_view)
-
-        self.v_split = QSplitter(Qt.Vertical)
-        self.v_split.setHandleWidth(5); self.v_split.setStyleSheet(_ss)
-        self.v_split.addWidget(self.h_split)
-        self.v_split.addWidget(persp_w)
-        self.v_split.setStretchFactor(0, 35)
-        self.v_split.setStretchFactor(1, 65)
-        root.addWidget(self.v_split, stretch=1)
+        root.addWidget(self.persp_view, stretch=1)
+        root.addLayout(bot)
 
     def _toggle_overlay(self):
         on = self.btn_overlay.isChecked()
@@ -2119,6 +2196,25 @@ class MapViewerWidget(QWidget):
         self.scale = scale
         self._update_transform()
         return True
+
+    def set_alignment(self, tx, ty, tz, roll, pitch, yaw, scale, stored=False):
+        """Put the scan where a saved scene had it (File > Open Scene).
+
+        One transform update for the lot, so the fusion is rebased once
+        rather than once per channel. Clamped, wrapped and rounded the way
+        a drag is.
+        """
+        scale = float(scale)
+        if not scale > 0.0:
+            raise ValueError("The alignment scale must be positive.")
+        self.tx, self.ty, self.tz = float(tx), float(ty), float(tz)
+        self.roll, self.pitch, self.yaw = (((float(a) + 180.0) % 360.0) - 180.0
+                                           for a in (roll, pitch, yaw))
+        self.scale = min(max(scale, self.SCALE_MIN), self.SCALE_MAX)
+        self._quantise_alignment()
+        self._update_transform()
+        self.pose_stored = bool(stored)
+        self.persp_view.set_mesh_edit_locked(self.pose_stored)
 
     @property
     def alignment_scale(self):
@@ -2236,20 +2332,14 @@ class MapViewerWidget(QWidget):
         T[:3, :3] = rpy_to_matrix(*np.radians(rpy))
         T[:3, 3] = pos
         self.cam_pose = T.copy()
-        self.top_view.set_cam(pos[0], pos[1])
-        self.side_view.set_cam(pos[0], pos[2])
         self.camera_moved.emit(T)
 
     def _on_persp_locator_changed(self):
         """User dragged the locator gizmo in the 3D viewport."""
-        T = self.persp_view.get_locator_transform()
-        px, py, pz = T[0, 3], T[1, 3], T[2, 3]
-        self.top_view.set_locator(px, py)
-        self.side_view.set_locator(px, pz)
-        self.locator_changed.emit(T)
+        self.locator_changed.emit(self.persp_view.get_locator_transform())
 
     def clear_map(self):
-        """Delete the loaded scan from all three views.
+        """Delete the loaded scan from the view.
 
         The alignment is reset with it: an alignment is a statement about
         where a particular scan sits, so keeping the numbers after the scan is
@@ -2264,8 +2354,6 @@ class MapViewerWidget(QWidget):
         self.pose_stored = False
         self.persp_view.set_mesh_edit_locked(False)
         self.persp_view.clear_map()
-        self.top_view.set_points([], [])
-        self.side_view.set_points([], [])
         # Hand the manipulator back to the tracking origin: leaving it on a
         # scan that no longer exists would draw a gizmo for nothing.
         self.persp_view.select_locator()
@@ -2275,15 +2363,12 @@ class MapViewerWidget(QWidget):
         """True while a scan is loaded."""
         return self.map_points_3d is not None and len(self.map_points_3d) > 0
 
-    def get_locator_transform(self):
-        return self.persp_view.get_locator_transform()
+    def get_locator_transform(self, locator_id=None):
+        return self.persp_view.get_locator_transform(locator_id)
 
-    def set_locator_transform(self, T):
+    def set_locator_transform(self, T, locator_id=None):
         """Programmatic/external set (does not emit locator_changed)."""
-        self.persp_view.set_locator_transform(T)
-        T = np.asarray(T, dtype=float)
-        self.top_view.set_locator(T[0, 3], T[1, 3])
-        self.side_view.set_locator(T[0, 3], T[2, 3])
+        self.persp_view.set_locator_transform(T, locator_id)
 
     def set_camera_intrinsics(self, K):
         self.camera_K = K
@@ -2296,7 +2381,7 @@ class MapViewerWidget(QWidget):
         """Take a new camera pose from the dashboard's 60 Hz refresh.
 
         The pose itself is kept every time it arrives; what is rate-limited
-        is *pushing it into the views*, because each push repaints all three
+        is *pushing it into the view*, because each push repaints it
         and that is what the GUI thread cannot afford sixty times a second.
         """
         from pose_transform import make_transform
@@ -2314,8 +2399,6 @@ class MapViewerWidget(QWidget):
             return
         self._last_view_push = now
 
-        self.top_view.set_cam(px, py)
-        self.side_view.set_cam(px, pz)
         from pose_transform import matrix_to_rpy
         rpy_deg = np.degrees(matrix_to_rpy(self.cam_pose[:3, :3]))
         self.persp_view.set_cam((px, py, pz), rpy_deg=rpy_deg)
@@ -2323,14 +2406,10 @@ class MapViewerWidget(QWidget):
             self._push_trail()
 
     def _push_trail(self):
-        """Hand the trail to the three views. Split out so clearing it
-        reaches them too -- otherwise a reset leaves the old path drawn."""
+        """Hand the trail to the view. Split out so clearing it reaches
+        the view too -- otherwise a reset leaves the old path drawn."""
         self._trail_dirty = False
-        t = list(self._trail)
-        self.persp_view.set_trail(t)
-        shown = self.persp_view.display_points("trail", t)
-        self.top_view.set_trail(shown[:, 0], shown[:, 1])
-        self.side_view.set_trail(shown[:, 0], shown[:, 2])
+        self.persp_view.set_trail(list(self._trail))
 
     def _get_aligned(self):
         if self.map_points_3d is None: return None
@@ -2342,8 +2421,6 @@ class MapViewerWidget(QWidget):
     def _redraw_map(self):
         pts = self._get_aligned()
         if pts is None: return
-        self.top_view.set_points(pts[:, 0], pts[:, 1])
-        self.side_view.set_points(pts[:, 0], pts[:, 2])
         if self.map_mesh_faces is not None:
             self.persp_view.set_mesh(pts, self.map_mesh_faces)
         else:

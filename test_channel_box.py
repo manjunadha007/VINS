@@ -45,7 +45,7 @@ class ChannelBoxTests(unittest.TestCase):
             np.testing.assert_allclose([f.value() for f in self.fields.values()],
                                        [n, -n, n / 10, 10*n, -5*n, 15*n], atol=1e-4)
 
-    def test_locator_numeric_edits_reach_transform_and_ortho_views(self):
+    def test_locator_numeric_edits_reach_transform(self):
         changed = Mock()
         camera = Mock()
         self.viewer.locator_changed.connect(changed)
@@ -55,8 +55,6 @@ class ChannelBoxTests(unittest.TestCase):
         T = changed.call_args.args[0]
         np.testing.assert_allclose(T[:3, 3], [1.25, -2.5, 3.75])
         np.testing.assert_allclose(T[:3, :3], rpy_to_matrix(*np.radians([12, -24, 36])))
-        self.assertEqual(self.viewer.top_view._locator, (1.25, -2.5))
-        self.assertEqual(self.viewer.side_view._locator, (1.25, 3.75))
         camera.assert_not_called()
 
     def test_scan_channels_move_and_rotate_about_its_centre(self):
@@ -167,13 +165,13 @@ class ChannelBoxTests(unittest.TestCase):
         self.select("trail")
         self.edit(tx=3, ty=4, tz=5, rz=90)
         np.testing.assert_allclose(self.view._trail, [(1, 0, 0), (2, 0, 0)])
-        np.testing.assert_allclose(self.viewer.top_view._trail, [(3, 5), (3, 6)])
-        np.testing.assert_allclose(self.viewer.side_view._trail, [(3, 5), (3, 5)])
+        np.testing.assert_allclose(self.view.display_points("trail", self.view._trail),
+                                   [(3, 5, 5), (3, 6, 5)])
         self.viewer._trail.append((3., 0., 0.))
         self.viewer._push_trail()
         self.view._center_on_selection()
         np.testing.assert_allclose(self.view._orb_center, [3, 7, 5])
-        np.testing.assert_allclose(self.viewer.top_view._trail[-1], [3, 7])
+        np.testing.assert_allclose(self.view.display_points("trail", self.view._trail)[-1], [3, 7, 5])
 
     def test_world_channels_transform_rendered_grid_without_moving_scan_or_camera(self):
         self.viewer.set_map_points(np.array([[1., 2., 3.]]))
@@ -199,9 +197,8 @@ class ChannelBoxTests(unittest.TestCase):
         self.assertFalse(self.view.gizmo_active)
 
     def test_small_viewport_can_scroll_to_last_rotation_field(self):
-        self.viewer.resize(650, 600)
+        self.viewer.resize(650, 380)     # a 3D view about 350 px tall
         self.viewer.show()
-        self.viewer.v_split.setSizes([200, 350])
         self.app.processEvents()
         scroll = self.view.channel_scroll
         field = self.fields["rz"]

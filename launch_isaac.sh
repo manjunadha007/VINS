@@ -84,7 +84,7 @@ fi
 # the bash -c running it first; see cleanup() below.
 echo "0/3 Stopping any previous run..."
 STALE=$(docker exec -u root "$CONTAINER" /bin/bash -c \
-    "ps -eo pid,cmd --no-headers | grep -E 'bridge_headless|dashboard_isaac|component_container|realsense2_camera_node' | grep -v grep | awk '{print \$1}'" 2>/dev/null | tr '\n' ' ')
+    "ps -eo pid,cmd --no-headers | grep -E 'bridge_headless|dashboard_isaac|component_container|realsense2_camera_node|realsense_streams.py' | grep -v grep | awk '{print \$1}'" 2>/dev/null | tr '\n' ' ')
 if [ -n "${STALE// /}" ]; then
     echo "    killing: $STALE"
     docker exec -u root "$CONTAINER" /bin/bash -c "kill -9 $STALE" >/dev/null 2>&1 || true
@@ -107,7 +107,8 @@ cleanup() {
     docker exec -u admin "$CONTAINER" /bin/bash -c \
         "pkill -f '[r]os2 launch' || true; \
          pkill -9 -f '[c]omponent_container' || true; \
-         pkill -9 -f '[r]ealsense2_camera' || true"
+         pkill -9 -f '[r]ealsense2_camera' || true; \
+         pkill -f '[r]ealsense_streams.py' || true"
     echo "✅ Pipeline shut down."
 }
 trap cleanup EXIT INT TERM
@@ -118,7 +119,7 @@ trap cleanup EXIT INT TERM
 # silently diverged; it is now generated on every launch. All of these modules
 # must land in the same directory — the dashboard imports them by name.
 echo "1/3 Deploying bridge to $WS/src ..."
-for f in marker_lineup.py lineup_solver.py lineup_dialog.py fusion_supervisor.py gnss_receiver.py tracking_preflight.py check_pipeline.py dashboard.py freed.py pose_transform.py tracking_config.py verify_tracking.py map_viewer.py bridge_headless.py depth_probe.py lidar_map_matcher.py image_alignment.py tracking_engine.py anchor_cli.py bench_fusion.py smoke_locator_lock.py smoke_lineup.py smoke_gizmo.py test_lidar_fusion.py test_image_alignment.py verify_region.py; do
+for f in projector_control.py gopro_stream.py realsense_streams.py depth_view.py scan_scale.py scan_localizer.py marker_map.py marker_lineup.py lineup_solver.py lineup_dialog.py fusion_supervisor.py gnss_receiver.py tracking_preflight.py check_pipeline.py dashboard.py freed.py pose_transform.py tracking_config.py verify_tracking.py map_viewer.py bridge_headless.py depth_probe.py lidar_map_matcher.py image_alignment.py tracking_engine.py anchor_cli.py bench_fusion.py smoke_locator_lock.py smoke_lineup.py smoke_gizmo.py test_lidar_fusion.py test_image_alignment.py verify_region.py; do
     cp "$DIR/$f" "$WS/src/$f" || exit 1
 done
 # Install the bundled scan beside the relative-path configuration.
@@ -190,6 +191,16 @@ docker exec -u admin "$CONTAINER" pip3 install -q "open3d>=0.18" 2>/dev/null || 
 # fails at import time with ModuleNotFoundError before the window even opens.
 echo "    ensuring PyOpenGL is installed..."
 docker exec -u admin "$CONTAINER" pip3 install -q PyOpenGL 2>/dev/null || echo "    ⚠️  PyOpenGL install failed (non-fatal)"
+
+# GNSS can be connected from Setup even when automatic connection is disabled.
+# Configure the same container user that runs the dashboard and headless bridge.
+echo "    ensuring GNSS serial input is available..."
+docker exec -u root "$CONTAINER" usermod -a -G dialout admin \
+    || echo "    ⚠️  could not grant GNSS serial-port access"
+if ! docker exec -u admin "$CONTAINER" python3 -c 'import serial' 2>/dev/null; then
+    docker exec -u admin "$CONTAINER" python3 -m pip install --user -q pyserial \
+        || echo "    ⚠️  pyserial install failed; GNSS input will be unavailable"
+fi
 
 # ── NumPy ABI guard ───────────────────────────────────────────────────────────
 # The container image ships NumPy 2.x in /usr/local/lib/python3.10/dist-packages,
@@ -271,6 +282,8 @@ bash "$DIR/ensure_realsense_imu.sh" "$CONTAINER" || exit 1
 # depth stays off however you invoke the script.
 docker exec -u admin -d -w /workspaces/isaac_ros-dev \
     -e VP_ENABLE_DEPTH="${VP_ENABLE_DEPTH:-0}" \
+    -e VP_EMITTER_MODE="${VP_EMITTER_MODE:-alternating}" \
+    -e VP_CAMERA_FPS="${VP_CAMERA_FPS:-90}" \
     "$CONTAINER" /bin/bash -c \
     "source /opt/ros/humble/setup.bash && source install/setup.bash && \
      export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:\$(find /workspaces/isaac_ros-dev/install -type d -name lib | grep gxf | tr '\n' ':') && \
@@ -281,12 +294,19 @@ case "${VP_ENABLE_DEPTH:-0}" in
     0|false|no|'') ;;
     *) DEPTH_CHECK_ARGS=(--require-depth) ;;
 esac
+if [ "${VP_SLAM_LAUNCH:-vp}" != "nvidia" ] &&
+   [ "${VP_EMITTER_MODE:-alternating}" = "alternating" ] &&
+   [ "${#DEPTH_CHECK_ARGS[@]}" -gt 0 ]; then
+    DEPTH_CHECK_ARGS+=(--require-active-depth)
+    echo "    Alternating projector: ${VP_CAMERA_FPS:-90} capture FPS, half for tracking and half for depth"
+fi
 if ! docker exec -u admin \
         -e VP_TRACKING_CONFIG=/workspaces/isaac_ros-dev/src/tracking.yaml \
         -w /workspaces/isaac_ros-dev "$CONTAINER" /bin/bash -c \
         'source /opt/ros/humble/setup.bash && source install/setup.bash &&
          python3 src/check_pipeline.py "$@"' pipeline-check "${DEPTH_CHECK_ARGS[@]}"; then
     echo "❌ Stereo / IMU / SLAM startup check failed. Recent camera/SLAM logs:"
+    echo "   Alternating mode requires emitter metadata. Try VP_CAMERA_FPS=60, or VP_EMITTER_MODE=off for passive depth."
     docker exec -u admin "$CONTAINER" tail -n 30 /tmp/hyperfusion-slam.log
     exit 1
 fi
@@ -323,10 +343,20 @@ else
         echo "   Either run from a graphical session, or use:  $0 --headless"
         exit 1
     fi
-    echo "3/3 Starting HyperFusion dashboard (DISPLAY=$DISPLAY)..."
+    # The NVIDIA GLX/Xwayland presentation path can leave the entire window
+    # blank even while Qt paints and camera callbacks keep running. EGL displays
+    # correctly on this rig, including after maximize/restore. Keep this scoped
+    # to the dashboard: Isaac's CUDA tracking still uses the GPU as before.
+    # Set QT_XCB_GL_INTEGRATION=xcb_glx to explicitly use the previous backend.
+    echo "3/3 Starting HyperFusion dashboard (DISPLAY=$DISPLAY, Qt=${QT_XCB_GL_INTEGRATION:-xcb_egl})..."
+    # PYTHONFAULTHANDLER: a native crash (segfault, "stack smashing detected")
+    # then leaves every thread's Python stack in the log, not just one line.
     docker exec -u admin -e DISPLAY="$DISPLAY" \
+        -e QT_XCB_GL_INTEGRATION="${QT_XCB_GL_INTEGRATION:-xcb_egl}" \
         -e VP_TRACKING_CONFIG=/workspaces/isaac_ros-dev/src/tracking.yaml \
+        -e PYTHONFAULTHANDLER=1 \
         -w /workspaces/isaac_ros-dev "$CONTAINER" /bin/bash -c \
         "source /opt/ros/humble/setup.bash && source install/setup.bash && \
-         python3 src/dashboard_isaac.py"
+         set -o pipefail && \
+         python3 -u src/dashboard_isaac.py 2>&1 | tee /tmp/hyperfusion-dashboard.log"
 fi

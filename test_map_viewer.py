@@ -125,8 +125,10 @@ class FramebufferResizeTests(unittest.TestCase):
                 QApplication.processEvents()
                 frame = view.grabFramebuffer().convertToFormat(QImage.Format_RGBA8888)
                 dpr = view.devicePixelRatioF()
-                self.assertAlmostEqual(frame.width(), width * dpr, delta=1)
-                self.assertAlmostEqual(frame.height(), height * dpr, delta=1)
+                # A real window manager can clamp the requested size to the
+                # screen's available area (e.g. excluding GNOME's top bar).
+                self.assertAlmostEqual(frame.width(), view.width() * dpr, delta=1)
+                self.assertAlmostEqual(frame.height(), view.height() * dpr, delta=1)
                 bits = frame.bits()
                 bits.setsize(frame.byteCount())
                 rgba = np.frombuffer(bits, np.uint8).reshape(
@@ -259,10 +261,87 @@ class OutlinerResizes(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_QT, "PyQt5 not available")
+class MultipleLocators(unittest.TestCase):
+    def setUp(self):
+        self.view = map_viewer.PerspView()
+        self.addCleanup(self.view.deleteLater)
+
+    def select(self, key):
+        for i in range(self.view.outliner_list.count()):
+            if self.view.outliner_list.item(i).data(Qt.UserRole) == key:
+                self.view.outliner_list.setCurrentRow(i)
+                return
+        self.fail(f"Missing locator {key}")
+
+    def test_duplicate_keeps_pose_but_needs_its_own_id(self):
+        original = np.eye(4)
+        original[:3,3] = [1,2,3]
+        self.view.set_locator_transform(original)
+        self.view.assign_locator_marker("DICT_4X4_50", 7, .2)
+        duplicate = self.view.duplicate_locator()
+        self.assertIsNotNone(duplicate)
+        np.testing.assert_allclose(self.view.get_locator_transform(), original)
+        self.assertIsNone(self.view.locator_entries()[duplicate]["marker"])
+        with self.assertRaisesRegex(ValueError, "already belongs"):
+            self.view.assign_locator_marker("DICT_4X4_50", 7, .2)
+        self.view.assign_locator_marker("DICT_4X4_50", 8, .15)
+        self.view._edit_channel(0, 4.)
+        self.view._edit_channel(5, 30.)
+        self.select("locator")
+        np.testing.assert_allclose(self.view.get_locator_transform(), original)
+        self.select(duplicate)
+        self.assertAlmostEqual(self.view.get_locator_transform()[0,3], 4.)
+        self.assertAlmostEqual(self.view._locator_rpy[2], 30.)
+        self.assertEqual(self.view.locator_entries()["locator"]["marker"]["id"], 7)
+
+    def test_auto_placed_marker_gets_its_own_locator_without_taking_the_selection(self):
+        self.view.assign_locator_marker("DICT_4X4_250", 3, .1)
+        selected = self.view.get_locator_transform()
+        T = np.eye(4)
+        T[:3, 3] = [1, -2, .2]
+        key = self.view.add_marker_locator(T, "DICT_4X4_250", 120, .1)
+        self.assertEqual(self.view._active_locator_id, "locator")
+        np.testing.assert_allclose(self.view.get_locator_transform(), selected)
+        entry = self.view.locator_entries()[key]
+        np.testing.assert_allclose(entry["transform"], T)
+        self.assertEqual(entry["marker"], dict(dictionary="DICT_4X4_250", id=120, size_m=.1))
+        with self.assertRaisesRegex(ValueError, "already belongs"):
+            self.view.add_marker_locator(T, "DICT_4X4_250", 3, .1)
+        self.assertEqual(len(self.view.locator_entries()), 2)
+        self.select(key)
+        self.assertIn("ID 120", self.view.outliner_list.currentItem().text())
+
+    def test_gizmo_row_selection_stays_on_duplicate_during_drag(self):
+        duplicate = self.view.duplicate_locator()
+        self.view._select_gizmo_row("locator")
+        self.assertEqual(self.view.outliner_list.currentItem().data(Qt.UserRole), duplicate)
+        self.view._gizmo_set_pos([5,6,7])
+        self.view._gizmo_changed()
+        np.testing.assert_allclose(self.view.get_locator_transform("locator"), np.eye(4))
+        np.testing.assert_allclose(self.view.get_locator_transform(duplicate)[:3,3], [5,6,7])
+
+    def test_assign_from_detected_id_and_remove_duplicate(self):
+        self.view.set_detected_markers([("DICT_4X4_50", 12, np.zeros((4,2)))])
+        self.view.locator_width.setValue(.25)
+        self.view._assign_detected_marker()
+        self.assertEqual(self.view.locator_entries()["locator"]["marker"],
+                         dict(dictionary="DICT_4X4_50", id=12, size_m=.25))
+        duplicate = self.view.duplicate_locator()
+        self.view.remove_locator()
+        self.assertNotIn(duplicate, self.view.locator_entries())
+        self.assertEqual(self.view._active_locator_id, "locator")
+        self.assertEqual(self.view.locator_entries()["locator"]["marker"]["id"], 12)
+        self.view.set_detected_markers([])
+        self.assertIsNone(self.view.detected_marker.currentData())
+        self.view.clear_locator_marker()
+        self.assertIsNone(self.view.locator_entries()["locator"]["marker"])
+
+
+@unittest.skipUnless(_HAS_QT, "PyQt5 not available")
 class ViewPushesAreRateLimited(unittest.TestCase):
     """Pose arrives at the UI timer's 60 Hz; the views must not repaint that
-    often. Each push repaints the 3D view and both ortho views, and at
-    1920x1080 with a full trail that measured 60 % of a core against a
+    often. Each push repaints the 3D view (then also two ortho views), and
+    at 1920x1080 with a full trail that measured 60 % of a core against a
     16.7 ms budget -- the GUI thread had nothing left to answer events with.
     """
 
@@ -521,24 +600,6 @@ class ScanRotatesAboutItsCentroid(unittest.TestCase):
         mv._on_persp_mesh_moved()
         np.testing.assert_allclose(mv._get_aligned(), got, atol=2e-3)
         mv.deleteLater()
-
-
-@unittest.skipUnless(_HAS_QT, "PyQt5 not available")
-class OrthoArrayProjectionMatchesScalar(unittest.TestCase):
-    """Same argument for the Top/Side views, which draw the trail twice more."""
-
-    def test_matches_scalar(self):
-        view = map_viewer.OrthoView("Top", "X", "Y")
-        view.resize(900, 600)
-        rng = np.random.default_rng(11)
-        for _ in range(50):
-            view._center = rng.normal(0, 3, 2)
-            view._scale = 10 ** rng.uniform(-1, 3)
-            pts = rng.normal(0, 10, (60, 2))
-            got = view._world_to_screen_arr(pts)
-            for i, (wh, wv) in enumerate(pts):
-                sx, sy = view._world_to_screen(wh, wv)
-                np.testing.assert_allclose(got[i], (sx, sy), rtol=1e-12)
 
 
 if __name__ == "__main__":
