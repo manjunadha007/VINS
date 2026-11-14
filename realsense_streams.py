@@ -56,10 +56,12 @@ class FrameJoin:
 
 STREAMS = ("infra1", "infra2", "depth")
 REQUIRED = tuple(STREAMS) + tuple(s + "_metadata" for s in STREAMS)
+TRACKING_STREAMS = ("infra1", "infra2")
+DEPTH_STREAMS = ("infra1", "depth")
 
 
-def exposure_state(parts):
-    states = [emitter_state(parts[s + "_metadata"].json_data) for s in STREAMS]
+def exposure_state(parts, streams=STREAMS):
+    states = [emitter_state(parts[s + "_metadata"].json_data) for s in streams]
     if None in states or len(set(states)) != 1:
         return None
     return states[0]
@@ -71,19 +73,52 @@ def route_exposure(parts, projector_off=False):
     return state == 0, state == 1 or (state == 0 and projector_off)
 
 
+class ExposureRouter:
+    """Independent, timestamp-matched stereo and depth/preview deliveries.
+
+    Stereo requires both IR images and their emitter metadata. It never waits
+    for depth. Depth retains its paired IR preview but does not wait for IR2.
+    Each branch still rejects projected tracking, unknown or conflicting
+    metadata, expired messages and backwards timestamps.
+    """
+
+    def __init__(self):
+        self.joins = {
+            name: FrameJoin(streams + tuple(s + "_metadata" for s in streams))
+            for name, streams in (("tracking", TRACKING_STREAMS), ("depth", DEPTH_STREAMS))
+        }
+        self.bad_metadata = 0
+
+    def add(self, kind, stamp, msg, projector_off=False, now=None):
+        deliveries = {}
+        for name, streams in (("tracking", TRACKING_STREAMS), ("depth", DEPTH_STREAMS)):
+            join = self.joins[name]
+            if kind not in join.required:
+                continue
+            parts = join.add(kind, stamp, msg, now)
+            if parts is None:
+                continue
+            state = exposure_state(parts, streams)
+            if state is None:
+                self.bad_metadata += 1
+            elif ((name == "tracking" and state == 0)
+                  or (name == "depth" and (state == 1 or projector_off))):
+                deliveries[name] = parts
+        return deliveries
+
+
 def main():
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import Image
     from realsense2_camera_msgs.msg import Metadata
 
     class Splitter(Node):
         def __init__(self):
             super().__init__("vp_realsense_splitter")
-            self.join = FrameJoin(REQUIRED)
+            self.router = ExposureRouter()
             self.counts = [0, 0]
-            self.bad_metadata = 0
             self.previous = time.monotonic()
             self.projector = ProjectorControl(RosProjectorParameters(self))
             self.create_timer(0.1, self.projector.tick)
@@ -103,28 +138,24 @@ def main():
                     self.subscriptions_.append(self.create_subscription(
                         msg_type, f"/camera/raw/{stream}/{suffix}",
                         lambda msg, key=kind: self.receive(key, msg),
-                        qos_profile_sensor_data))
+                        QoSProfile(depth=24, reliability=ReliabilityPolicy.BEST_EFFORT)))
             self.create_timer(5.0, self.report)
             self.get_logger().info(
                 "Routing emitter-off stereo and active/passive depth; "
                 "unknown metadata is rejected.")
 
         def receive(self, kind, msg):
-            parts = self.join.add(kind, stamp_ns(msg), msg)
-            if parts is None:
-                return
-            state = exposure_state(parts)
-            if state is None:
-                self.bad_metadata += 1
-                return
-            self.counts[state] += 1
             confirmed = self.projector.state
-            tracking, depth = route_exposure(
-                parts, projector_off=confirmed is not None and not confirmed.enabled)
-            if tracking:
+            deliveries = self.router.add(kind, stamp_ns(msg), msg,
+                projector_off=confirmed is not None and not confirmed.enabled)
+            if "tracking" in deliveries:
+                parts = deliveries["tracking"]
+                self.counts[0] += 1
                 self.outputs["infra1"].publish(parts["infra1"])
                 self.outputs["infra2"].publish(parts["infra2"])
-            if depth:
+            if "depth" in deliveries:
+                parts = deliveries["depth"]
+                self.counts[1] += 1
                 self.outputs["depth"].publish(parts["depth"])
                 self.preview.publish(parts["infra1"])
 
@@ -133,13 +164,14 @@ def main():
             dt = now - self.previous
             confirmed = self.projector.state
             passive = confirmed is not None and not confirmed.enabled
-            depth_rate = self.counts[0 if passive else 1] / dt
+            depth_rate = self.counts[1] / dt
             depth_mode = "passive" if passive else "emitter-on"
             message = (f"Emitter-off stereo {self.counts[0] / dt:.1f} Hz; "
                        f"{depth_mode} depth {depth_rate:.1f} Hz; "
-                       f"invalid metadata {self.bad_metadata}; "
-                       f"incomplete/late exposures {self.join.dropped}")
-            if not self.counts[0] or (not passive and not self.counts[1]):
+                       f"invalid metadata {self.router.bad_metadata}; "
+                       f"incomplete/late stereo {self.router.joins['tracking'].dropped}; "
+                       f"incomplete/late depth {self.router.joins['depth'].dropped}")
+            if not self.counts[0] or not self.counts[1]:
                 self.get_logger().warning(message + "; check emitter mode and metadata")
             else:
                 self.get_logger().info(message)

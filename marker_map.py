@@ -242,6 +242,27 @@ def _degrees(a, b):
     return float(np.degrees(np.arccos(np.clip(cosine, -1, 1))))
 
 
+def mean_rotation(rotations):
+    """The rotation closest to the average of `rotations` (chordal L2 mean)."""
+    U, _, Vt = np.linalg.svd(np.sum(np.asarray(rotations, dtype=float), axis=0))
+    return U @ np.diag([1., 1., np.sign(np.linalg.det(U @ Vt))]) @ Vt
+
+
+def steady_rotation(rotations, count, agree_deg):
+    """Mean of the last `count` rotations if every one is within `agree_deg` of it.
+
+    One frame's measurement of a marker's rotation can be several degrees out
+    (small or oblique squares, depth noise on the patch around them); turning a
+    Locator from it then makes the joint solve reject the layout. None until
+    `count` successive frames agree.
+    """
+    recent = list(rotations)[-count:]
+    if len(recent) < count:
+        return None
+    mean = mean_rotation(recent)
+    return mean if all(_degrees(R, mean) <= agree_deg for R in recent) else None
+
+
 def _surface(marker, max_points=4000):
     """The surface a marker is stuck to, from depth: (unit normal, point) in SLAM.
 
@@ -390,7 +411,8 @@ class MarkerSightings:
 
 
 def level_locators_from_view(observation, max_miss_m=.10, min_error_deg=10., min_spread_m=.3,
-                             T_display_map=None, log=None, snap_mounts=True):
+                             T_display_map=None, log=None, snap_mounts=True,
+                             min_marker_px=None, max_view_deg=None):
     """Assigned Locators turned the way the camera sees their markers.
 
     A rotation is easy to get wrong by hand: a Locator duplicated from a floor
@@ -405,6 +427,9 @@ def level_locators_from_view(observation, max_miss_m=.10, min_error_deg=10., min
     `min_error_deg=0` returns every measured orientation, even if it happens
     to match the entered rotation. `snap_mounts=False` preserves the measured
     surface tilt instead of assuming perfectly level walls and floors.
+    `min_marker_px` / `max_view_deg` leave alone a marker whose square is
+    smaller than that across, or seen more than that off face-on: its
+    rotation cannot be measured to a few degrees from there.
 
     Returns (corrections, note). Each correction is (key, T_map_locator,
     degrees turned, on_wall) for a Locator more than `min_error_deg` off what
@@ -505,8 +530,17 @@ def level_locators_from_view(observation, max_miss_m=.10, min_error_deg=10., min
                         "Run Auto lineup with three assigned Locators to calibrate scale; "
                         "keep their placements on the scan.")
         return [], misplaced()
-    corrections, unclear = [], []
-    for marker, branches, surface, _ in seen:
+    corrections, unclear, distant = [], [], []
+    for marker, branches, surface, centre in seen:
+        if min_marker_px is not None or max_view_deg is not None:
+            corners = np.asarray(marker.corners, dtype=float)
+            across = float(np.linalg.norm(corners - np.roll(corners, 1, axis=0), axis=1).max())
+            face = surface[0] if surface is not None else branches[0][:3, 2]
+            camera = (marker.T_slam_image @ T_BODY_OPTICAL)[:3, 3]
+            if ((min_marker_px is not None and across < min_marker_px)
+                    or (max_view_deg is not None and _degrees(face, camera - centre) > max_view_deg)):
+                distant.append(marker.marker_id)
+                continue
         rotations = [R @ T[:3, :3] for T in branches]
         measured = None
         if surface is not None:
@@ -545,11 +579,14 @@ def level_locators_from_view(observation, max_miss_m=.10, min_error_deg=10., min
         T[:3, :3] = rotation
         corrections.append(((marker.family, marker.marker_id), T,
                             _degrees(marker.T_map_locator[:3, :3], rotation), on_wall))
-    note = ""
+    notes = []
+    if distant:
+        notes.append(f"Marker(s) {', '.join(map(str, distant))} are too small or too edge-on to measure "
+                     "their rotation: move closer and face them.")
     if unclear:
-        note = (f"Could not check the rotation of marker(s) {', '.join(map(str, unclear))}: "
-                "keep the wall or floor around them in the depth view.")
-    return corrections, note
+        notes.append(f"Could not check the rotation of marker(s) {', '.join(map(str, unclear))}: "
+                     "keep the wall or floor around them in the depth view.")
+    return corrections, " ".join(notes)
 
 
 class MappedMeasurement(MapMeasurement):

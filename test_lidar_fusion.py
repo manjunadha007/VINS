@@ -1366,6 +1366,17 @@ class TestDashboardOverlayWiring(unittest.TestCase):
                          "the pose must be looked up at the frame's own stamp")
         self.assertIsNotNone(stub._ar_overlay)
 
+    def test_lost_lineup_hands_the_panel_back_to_the_live_camera(self):
+        """The display prefers the overlay frame over the live picture. Once
+        the lineup is lost (recovery clears it), the last overlay frame must
+        go, or the camera panel freezes on that moment."""
+        stub = self._stub()
+        _dashboard.HyperFusionApp._refresh_ar_overlay(stub)
+        self.assertIsNotNone(stub._ar_overlay)
+        stub.lidar_matcher.is_aligned = False
+        _dashboard.HyperFusionApp._refresh_ar_overlay(stub)
+        self.assertIsNone(stub._ar_overlay)
+
     def test_transparency_slider_changes_the_next_overlay_and_keeps_its_pose_pair(self):
         from PyQt5.QtWidgets import QApplication, QMainWindow
         app = QApplication.instance() or QApplication([])

@@ -739,7 +739,12 @@ class PerspView(QOpenGLWidget):
             self._trail = pts_3d
         self.update()
 
-    def set_cam(self, pt_3d, yaw_deg=None, rpy_deg=None):
+    #: True draws the camera dot amber: tracked, but not sent to Unreal.
+    cam_output_held = False
+
+    def set_cam(self, pt_3d, yaw_deg=None, rpy_deg=None, output_held=None):
+        if output_held is not None:
+            self.cam_output_held = bool(output_held)
         with self._lock:
             # Do not fight the operator: while the camera gizmo is being
             # dragged, the live pose must not yank it back.
@@ -1647,16 +1652,18 @@ class PerspView(QOpenGLWidget):
         if self.gizmo_active:
             self._draw_gizmo(p, basis)
 
-        # Camera dot (glow + solid core)
+        # Camera dot (glow + solid core). Red while its pose is going out to
+        # Unreal, amber while that output is held but tracking continues.
         scr, ok = self._project_pts(cam.reshape(1, 3), basis)
         if ok[0]:
             sx, sy = scr[0]
+            r, g, b = (255, 170, 0) if self.cam_output_held else (255, 50, 50)
             p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(QColor(255, 50, 50, 40)))
+            p.setBrush(QBrush(QColor(r, g, b, 40)))
             p.drawEllipse(QPointF(sx, sy), 18, 18)
-            p.setBrush(QBrush(QColor(255, 50, 50, 80)))
+            p.setBrush(QBrush(QColor(r, g, b, 80)))
             p.drawEllipse(QPointF(sx, sy), 10, 10)
-            p.setBrush(QBrush(QColor('#ff4444')))
+            p.setBrush(QBrush(QColor('#ffaa00' if self.cam_output_held else '#ff4444')))
             p.drawEllipse(QPointF(sx, sy), 5, 5)
 
         # Nav hint
@@ -2116,6 +2123,10 @@ class MapViewerWidget(QWidget):
         """Unlock the alignment and drop the trail drawn under the old one."""
         self.pose_stored = False
         self.persp_view.set_mesh_edit_locked(False)
+        self.clear_trail()
+
+    def clear_trail(self):
+        """Forget the camera's path, in the widget and the view."""
         self._trail.clear()
         self._push_trail()
 
@@ -2377,15 +2388,21 @@ class MapViewerWidget(QWidget):
         self.latest_frame = frame_bgr
         self.persp_view.set_overlay(frame_bgr)
 
-    def update_camera_pose(self, position, quaternion):
+    def update_camera_pose(self, position, quaternion, output_live=True):
         """Take a new camera pose from the dashboard's 60 Hz refresh.
 
         The pose itself is kept every time it arrives; what is rate-limited
         is *pushing it into the view*, because each push repaints it
         and that is what the GUI thread cannot afford sixty times a second.
+
+        `output_live` False draws the dot amber: the camera is tracked but
+        its pose is not currently going out to Unreal (output held).
         """
         from pose_transform import make_transform
         self.cam_pose = make_transform(position, quaternion)
+        held = not output_live
+        if held != self.persp_view.cam_output_held:
+            self._last_view_push = 0.0      # show the colour change at once
         px, py, pz = float(position[0]), float(position[1]), float(position[2])
 
         last = self._trail[-1] if self._trail else None
@@ -2401,7 +2418,7 @@ class MapViewerWidget(QWidget):
 
         from pose_transform import matrix_to_rpy
         rpy_deg = np.degrees(matrix_to_rpy(self.cam_pose[:3, :3]))
-        self.persp_view.set_cam((px, py, pz), rpy_deg=rpy_deg)
+        self.persp_view.set_cam((px, py, pz), rpy_deg=rpy_deg, output_held=held)
         if self._trail_dirty:
             self._push_trail()
 

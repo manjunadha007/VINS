@@ -1,7 +1,50 @@
 import json
 import unittest
 from types import SimpleNamespace
-from realsense_streams import FrameJoin, REQUIRED, emitter_state, exposure_state, route_exposure
+from realsense_streams import (FrameJoin, ExposureRouter, REQUIRED, emitter_state,
+                              exposure_state, route_exposure)
+
+
+class IndependentDeliveryTests(unittest.TestCase):
+    def feed(self, router, stamp, streams, state=0, off=False, now=0):
+        deliveries = {}
+        for stream in streams:
+            deliveries.update(router.add(stream, stamp, (stream, stamp), off, now))
+            metadata = SimpleNamespace(json_data=json.dumps({"frame_emitter_mode": state}))
+            deliveries.update(router.add(stream + "_metadata", stamp, metadata, off, now))
+        return deliveries
+
+    def test_missing_depth_never_starves_stereo(self):
+        router = ExposureRouter()
+        for stamp in range(1, 80):
+            output = self.feed(router, stamp, ("infra1", "infra2"), now=stamp / 90)
+            self.assertEqual(set(output), {"tracking"})
+            self.assertEqual(output["tracking"]["infra1"], ("infra1", stamp))
+        self.assertGreater(router.joins["depth"].dropped, 0)
+        self.assertEqual(router.joins["tracking"].dropped, 0)
+
+    def test_missing_right_ir_does_not_starve_paired_depth_preview(self):
+        output = self.feed(ExposureRouter(), 1, ("depth", "infra1"), state=1)
+        self.assertEqual(set(output), {"depth"})
+        self.assertEqual(output["depth"]["depth"][1], output["depth"]["infra1"][1])
+
+    def test_projected_ir_and_conflicting_ir_metadata_never_reach_tracking(self):
+        router = ExposureRouter()
+        self.assertNotIn("tracking", self.feed(router, 1, ("infra1", "infra2"), state=1))
+        self.feed(router, 2, ("infra1",), state=0)
+        self.assertNotIn("tracking", self.feed(router, 2, ("infra2",), state=1))
+        self.assertEqual(router.bad_metadata, 1)
+
+    def test_delayed_depth_cannot_block_or_roll_back_new_stereo(self):
+        router = ExposureRouter()
+        self.feed(router, 1, ("infra1", "infra2"), now=0)
+        self.assertIn("tracking", self.feed(router, 2, ("infra1", "infra2"), now=.3))
+        self.assertEqual(self.feed(router, 1, ("depth",), off=True, now=.31), {})
+        self.assertEqual(self.feed(router, 1, ("infra1", "infra2"), now=.32), {})
+
+    def test_passive_switch_retains_depth_and_tracking(self):
+        output = self.feed(ExposureRouter(), 1, ("infra2", "depth", "infra1"), off=True)
+        self.assertEqual(set(output), {"tracking", "depth"})
 
 
 class EmitterTests(unittest.TestCase):

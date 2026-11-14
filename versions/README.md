@@ -12,6 +12,7 @@ have no relative-import tricks, so a snapshot can be run and tested in place.
 | [v1.5](v1.5/VERSION.md) | frozen | Hardware-checked startup: no dashboard until stereo, IMU and SLAM stream; D455 IMU fixed inside the container. Validated live direct and through a 5 Gbps hub. |
 | [v1.6](v1.6/VERSION.md) | frozen | Camera keeps moving on stereo/IMU after lineup (amber "Camera tracking"); VO no longer throttled to 1 Hz; scan match gate 95 % → 75 %. Not yet validated live. |
 | [v1.7](v1.7/VERSION.md) | frozen | Several markers solved together and self-placed after one lineup; depth-measured scan scale; 45+45 Hz alternating projection with depth preview; GoPro preview replaces TOP/FRONT. Locked live at 99 %; one unexplained dashboard abort. |
+| [v1.7.1](v1.7.1/VERSION.md) | frozen | Lineup recovers by itself after tracking jumps (3 agreeing checks, then FreeD eases back); Locator rotations only from steady, clear views; stereo no longer waits for depth. Seen live outdoors, recovered from five jumps of up to 6 m. |
 | — | **in development** — repository root | See `../VERSION.md`. |
 
 ## Verifying a snapshot
@@ -23,8 +24,8 @@ Each one carries its own tests and can be checked without ROS:
 
 v1.2 passes 92 tests this way; v1.4 passes 123 offline plus 57 viewport tests;
 v1.5 passes 131 offline plus 63 viewport/marker/channel/startup-check tests;
-v1.6 passes 423 unit tests inside the Isaac container; v1.7 passes 561 there, plus
-the three smoke scripts.
+v1.6 passes 423 unit tests inside the Isaac container; v1.7 passes 561 there and
+v1.7.1 passes 601, each plus the three smoke scripts.
 
 ## Rolling back
 
@@ -32,7 +33,7 @@ the three smoke scripts.
 
 From v1.5 on, also restore `patches/` (read by `ensure_realsense_imu.sh`):
 
-    cp -r versions/v1.5/patches .   # or versions/v1.6/patches, versions/v1.7/patches
+    cp -r versions/v1.5/patches .   # or versions/v1.6/patches, versions/v1.7/patches, versions/v1.7.1/patches
 
 Then redeploy into the container with `./launch_isaac.sh`, which copies the
 bridge modules into `~/workspaces/isaac_ros-dev/src/` on every launch.

@@ -82,6 +82,9 @@ tracking:
   gate_enabled: true
   gate_max_speed_m_s: 3.0
   gate_max_jump_m: 0.05
+  # Permit travel at the configured speed across short frame-delivery gaps.
+  # The allowance is capped here and cannot grow through repeated rejections.
+  gate_max_gap_s: 0.2
   gate_max_angular_deg_s: 900.0
   gate_max_consecutive_rejects: 15
 
@@ -372,6 +375,10 @@ fusion:
   allow_vio_fallback: true
   single_source_grace_s: 1.0      # applies only with allow_vio_fallback: false
   recovery_samples: 3
+  # Automatic re-acquisition requires at least three fresh marker + scan solves
+  # agreeing on the same world alignment, followed by gradual output recovery.
+  recovery_consistency_m: 0.03
+  recovery_consistency_deg: 1.5
   min_scan_rank: 3
   depth_pose_tolerance_s: 0.035
   depth_timeout_s: 0.5

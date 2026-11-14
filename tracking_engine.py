@@ -51,7 +51,7 @@ import freed
 from pose_transform import (T_BODY_OPTICAL, PoseGate, PosePredictor,
                             PoseSmoother, PoseTransformer, StationaryHold,
                             make_transform, rpy_to_matrix, matrix_to_quaternion,
-                            se3_interpolate, so3_log)
+                            quaternion_to_matrix, se3_interpolate, so3_log)
 
 
 class MarkerSolution:
@@ -109,7 +109,8 @@ class TrackingEngine:
             max_speed_m_s=trk.get("gate_max_speed_m_s", 3.0),
             max_angular_deg_s=trk.get("gate_max_angular_deg_s", 900.0),
             max_jump_m=trk.get("gate_max_jump_m", 0.05),
-            max_consecutive_rejects=trk.get("gate_max_consecutive_rejects", 15))
+            max_consecutive_rejects=trk.get("gate_max_consecutive_rejects", 15),
+            max_gap_s=trk.get("gate_max_gap_s", 0.2))
         self.hold = StationaryHold(
             enabled=trk.get("hold_enabled", True),
             gyro_still_rad_s=trk.get("hold_gyro_still_rad_s", 0.05),
@@ -176,6 +177,7 @@ class TrackingEngine:
         self._output_time = None
         self._output_held = False
         self._relineup_required = False
+        self._verified_recovery = False
         self.gnss_fix = None
         self.gnss_reason = "GNSS disabled; outdoor setup required"
         self._gnss_epoch = None
@@ -258,13 +260,15 @@ class TrackingEngine:
         quaternion = np.asarray(quaternion, dtype=float) / np.linalg.norm(quaternion)
         gate_t = stamp if stamp is not None else now
 
+        previous_resyncs = self.gate.resyncs
+        previous_pose_time = self._last_pose_mono
         position, quaternion, snapped, reason = self.gate.filter(
             position, quaternion, gate_t)
         if snapped:
             linear = (0.0, 0.0, 0.0)
             angular = (0.0, 0.0, 0.0)
             if self.gate.consecutive_rejects <= 1:
-                self.log(f"[Gate] {reason} — holding pose")
+                self.log(f"[Gate] sensor={gate_t:.6f} host={now:.6f} {reason} — holding pose")
 
         self._pose_rejected = snapped
         position, quaternion, held = self.hold.apply(position, quaternion)
@@ -272,7 +276,19 @@ class TrackingEngine:
             linear = (0.0, 0.0, 0.0)
             angular = (0.0, 0.0, 0.0)
 
+        # Isaac's twist is in the camera body frame (Odometry child_frame_id;
+        # cuVSLAM differences poses as T0^-1 * T1), while the predictor moves
+        # position in the world frame. Rotate it with the gated, held
+        # orientation, so a resync's rotation offset applies to velocity too.
+        # Treating it as world velocity extrapolated sideways once the
+        # camera had panned away from its start heading.
+        linear = quaternion_to_matrix(quaternion) @ np.asarray(linear, dtype=float)
+
         with self._lock:
+            if self.gate.resyncs != previous_resyncs:
+                # A continuity offset changes the pose coordinate history.
+                # Never pair a new image with a pose from before that reset.
+                self._pose_history.clear()
             self.latest_pose = (position, quaternion)
             self.predictor.update(position, quaternion, linear, angular, now)
             self.last_vio_time = now
@@ -286,7 +302,8 @@ class TrackingEngine:
 
         if self.slam_status != "TRACKING":
             self.slam_status = "TRACKING"
-            self.log("[SLAM] ✅ Tracking — streaming 6DOF to Unreal Engine.")
+            if not snapped and (previous_pose_time is None or mono - previous_pose_time > self.stale_timeout):
+                self.log("[SLAM] Camera poses received.")
         return True
 
     def camera_pose_now(self):
@@ -331,6 +348,38 @@ class TrackingEngine:
         if pose is None:
             return None
         return self.transformer.pose_with_zero_ros(pose[0], pose[1])
+
+    def camera_pose_ros_live(self):
+        """Where the camera is right now in the scan, for the dashboard's 3D
+        view: (position, quaternion, output_live), or None before any pose.
+
+        The live stereo / IMU pose with the current lineup applied, in ROS
+        canonical metres -- the same pose and alignment the scan overlay is
+        drawn with, so the camera dot moves exactly as the overlay does.
+
+        Unlike camera_pose_ros_corrected() this is never held. That one is
+        the FreeD output, which the supervisor freezes in HOLD, RELINEUP and
+        ALIGNING and slews back after a hold; drawing it made the dot stop
+        dead while the camera and the scan overlay kept moving. The hold is
+        reported instead: `output_live` is False whenever Unreal is not being
+        sent this pose.
+        """
+        if not self.fusion.enabled:
+            pose = self.camera_pose_ros_corrected()
+            return None if pose is None else (pose[0], pose[1], True)
+        self.camera_pose_now()   # advance the output supervisor, as before
+        with self._lock:
+            if not self.predictor.has_pose:
+                return None
+            # Same prediction and composition as _supervised_pose(), so the
+            # dot and the FreeD output agree exactly whenever output is live.
+            position, quaternion = self.predictor.predict(time.time())
+            T = make_transform(position, quaternion) @ self.transformer._rig
+            if self.transformer._zero is not None:
+                T = self.transformer._zero @ T
+            output_live = (self._output_T is not None and not self._output_held
+                           and self.fusion_status()["output_allowed"])
+        return T[:3, 3].copy(), matrix_to_quaternion(T[:3, :3]), output_live
 
     def freed_packet(self):
         """The 29-byte FreeD packet for right now, or None if nothing tracked."""
@@ -407,7 +456,39 @@ class TrackingEngine:
             self._output_time = None
             self._output_held = False
             self._relineup_required = False
+            self._verified_recovery = False
             self._gnss_epoch = None
+
+    def begin_recovery(self):
+        """Quarantine a changed tracking frame while retaining the held output."""
+        with self._lock:
+            self.fusion.reset()
+            self._relineup_required = True
+            self._verified_recovery = False
+            self._output_held = self._output_T is not None
+            self._output_time = time.monotonic()
+
+    def resume_verified_recovery(self):
+        """Resume after the caller installs a fresh, repeated geometric solve.
+
+        Unlike explicit lineup, this preserves the last transmitted pose and
+        slews toward the verified target. Fresh scan/marker evidence is required;
+        camera-only motion or GNSS cannot release a large recovery.
+        """
+        with self._lock:
+            now = time.monotonic()
+            fresh = (self._last_pose_mono is not None
+                     and 0 <= now - self._last_pose_mono <= self.stale_timeout
+                     and not self._pose_rejected)
+            status = self.fusion.evaluate(now, fresh, self.is_anchored)
+            if not fresh or not self.is_anchored or not any(
+                    source in status["supported_by"] for source in ("markers", "scan")):
+                return False
+            self._relineup_required = False
+            self._verified_recovery = True
+            self._output_held = self._output_T is not None
+            self._output_time = now
+            return True
 
     def update_gnss(self, fix):
         self.gnss_fix = fix
@@ -456,6 +537,7 @@ class TrackingEngine:
             now = time.monotonic()
             status = self.fusion_status()
             if not self.predictor.has_pose or not status["output_allowed"]:
+                self._verified_recovery = False
                 self._output_held = self._output_T is not None
                 self._output_time = now
                 return self._output_pose, False
@@ -467,7 +549,9 @@ class TrackingEngine:
                 cfg = self.cfg.get("fusion", {})
                 distance = float(np.linalg.norm(T[:3, 3] - self._output_T[:3, 3]))
                 angle = math.degrees(float(np.linalg.norm(so3_log(self._output_T[:3, :3].T @ T[:3, :3]))))
-                if distance > cfg.get("recovery_max_distance_m", 0.10) or angle > cfg.get("recovery_max_angle_deg", 5.0):
+                if (not self._verified_recovery and
+                        (distance > cfg.get("recovery_max_distance_m", 0.10)
+                         or angle > cfg.get("recovery_max_angle_deg", 5.0))):
                     self._relineup_required = True
                     return self._output_pose, False
                 dt = min(max(now - (self._output_time or now), 0.0), 0.05)
@@ -475,6 +559,8 @@ class TrackingEngine:
                             cfg.get("recovery_slew_deg_s", 5.0) * dt / max(angle, 1e-9))
                 T = se3_interpolate(self._output_T, T, alpha)
                 self._output_held = alpha < 1.0
+            if not self._output_held:
+                self._verified_recovery = False
             self._output_T = T
             self._output_time = now
             self._output_pose = self.transformer.world_transform_to_unreal(T)

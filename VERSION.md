@@ -1,3 +1,26 @@
+# 2026-11-14 — v1.7.1 snapshot: lineup recovers by itself, steady Locator rotations
+
+Frozen as `versions/v1.7.1/`. v1.7's pipeline with the lineup no longer lost
+for good after a tracking jump.
+
+A tracking resync or "Camera moved too far during hold" used to switch Auto
+lineup off and freeze FreeD until a manual lineup. Now it keeps the marker
+layout, holds FreeD, and re-acquires from 3 fresh marker-and-scan checks that
+agree to 3 cm / 1.5°, then eases FreeD back without a jump. Locator rotations
+are measured only from markers at least 30 px across and within 65° of
+face-on, and only when 3 frames in a row agree to 3°. Stereo no longer waits
+for depth in alternating mode (44.9 Hz, up from 29–35 Hz). Prediction now uses
+Isaac's body-frame velocity correctly. The FreeD button shows what is sent
+(Live / Held / Recovering …). Also new: a Reset Scene button, and a camera dot
+that keeps following the camera while output is held.
+
+Seen live on 2026-11-14 outdoors on the terrace with the projector off
+(`VP_EMITTER_MODE=off`). It locked at 94 % on the scan with a 47 mm median
+miss. Over 6 minutes it recovered by itself from five tracking jumps of up to
+6.0 m. Passes 601 unit tests in the Isaac image plus the three smoke scripts.
+Known limits: locks pass at 41–49 mm against the 50 mm limit; cuVSLAM jumps
+when the view leaves the terrace; GNSS is not RTK.
+
 # 2026-11-10 — v1.7 snapshot: multi-marker layouts, scan scale, GoPro view
 
 Frozen as `versions/v1.7/`. v1.6's pipeline with several ArUco markers solved

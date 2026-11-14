@@ -779,12 +779,15 @@ class PoseGate:
     """
 
     def __init__(self, max_speed_m_s=5.0, max_angular_deg_s=900.0,
-                 max_jump_m=0.15, max_consecutive_rejects=15, enabled=True):
+                 max_jump_m=0.15, max_consecutive_rejects=15, enabled=True,
+                 max_gap_s=0.2):
         self.enabled = bool(enabled)
         self.max_speed_m_s = float(max_speed_m_s)
         self.max_angular_deg_s = float(max_angular_deg_s)
         self.max_jump_m = float(max_jump_m)
         self.max_consecutive_rejects = int(max_consecutive_rejects)
+        self.max_gap_s = max(0.0, float(max_gap_s))
+        self._rejection_step_limit = None
 
         self._last_pos = None
         self._last_quat = None
@@ -820,7 +823,15 @@ class PoseGate:
 
         step = float(np.linalg.norm(position - self._last_pos))
 
-        # The absolute step test always applies. The rate tests only apply when
+        # Allow physically plausible travel over a short delivery gap. Keep
+        # the allowance fixed throughout a rejection streak: repeated bad
+        # poses must not buy themselves a larger jump allowance by waiting.
+        step_limit = self._rejection_step_limit
+        if step_limit is None:
+            step_limit = max(self.max_jump_m,
+                             self.max_speed_m_s * min(dt, self.max_gap_s))
+
+        # The bounded step test always applies. The rate tests only apply when
         # dt is large enough to be meaningful: `now` should be the message
         # timestamp, but if poses ever arrive batched (or a caller passes arrival
         # time) dt collapses towards zero and every real move looks like it
@@ -829,8 +840,8 @@ class PoseGate:
         rate_tests_valid = dt >= _MIN_RATE_DT_S
 
         reason = None
-        if step > self.max_jump_m:
-            reason = (f"jump {step * 1000:.0f}mm > {self.max_jump_m * 1000:.0f}mm")
+        if step > step_limit:
+            reason = (f"jump {step * 1000:.0f}mm > {step_limit * 1000:.0f}mm")
         elif rate_tests_valid:
             speed = step / dt
             ang_speed = self._angle_between(self._last_quat, quaternion) / dt
@@ -841,10 +852,12 @@ class PoseGate:
 
         if reason is None:
             self.consecutive_rejects = 0
+            self._rejection_step_limit = None
             self._commit(position, quaternion, now)
             return True, None
 
         self.consecutive_rejects += 1
+        self._rejection_step_limit = step_limit
         self.total_rejects += 1
         self.last_reason = reason
 
@@ -852,6 +865,7 @@ class PoseGate:
             # Persistent disagreement means the tracker really has moved on.
             self.resyncs += 1
             self.consecutive_rejects = 0
+            self._rejection_step_limit = None
             self._commit(position, quaternion, now)
             return True, f"resync after {reason}"
 
@@ -868,6 +882,7 @@ class PoseGate:
         self._last_quat = None
         self._last_t = None
         self.consecutive_rejects = 0
+        self._rejection_step_limit = None
         self._offset_pos = np.zeros(3)
         self._offset_rot = np.eye(3)
 
@@ -898,21 +913,21 @@ class PoseGate:
 
         if not accepted:
             # Hold: report the previous corrected pose unchanged.
-            out_pos = self._offset_pos + (prev_pos if prev_pos is not None
-                                          else raw_pos)
+            out_pos = self._offset_pos + self._offset_rot @ (
+                prev_pos if prev_pos is not None else raw_pos)
             out_rot = self._offset_rot @ quaternion_to_matrix(
                 prev_quat if prev_quat is not None else raw_quat)
             return out_pos, matrix_to_quaternion(out_rot), True, reason
 
         if reason and prev_pos is not None and prev_quat is not None:
             # Resync: absorb the discontinuity instead of passing it on.
-            target_pos = self._offset_pos + prev_pos
-            self._offset_pos = target_pos - raw_pos
+            target_pos = self._offset_pos + self._offset_rot @ prev_pos
             target_rot = self._offset_rot @ quaternion_to_matrix(prev_quat)
             self._offset_rot = target_rot @ quaternion_to_matrix(raw_quat).T
+            self._offset_pos = target_pos - self._offset_rot @ raw_pos
             self.absorbed = getattr(self, "absorbed", 0) + 1
 
-        out_pos = self._offset_pos + raw_pos
+        out_pos = self._offset_pos + self._offset_rot @ raw_pos
         out_rot = self._offset_rot @ quaternion_to_matrix(raw_quat)
         return out_pos, matrix_to_quaternion(out_rot), bool(reason), reason
 

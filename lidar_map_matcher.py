@@ -454,15 +454,26 @@ class LidarMapMatcher:
         self._pyramid_dirty = False
         self._mesh_vertices = None
         self._mesh_triangles = None
+        self.clear_alignment()
+        if self.edge_aligner is not None:
+            self.edge_aligner.clear_mesh()
+
+    def clear_alignment(self):
+        """Forget where the camera is on the scan; keep the scan itself.
+
+        Back to the state a freshly loaded scan is in, waiting for a lineup.
+        The generation bump discards any ICP or marker fix still in flight,
+        so nothing solved under the old lineup lands after it.
+        """
         self.is_aligned = False
+        self.has_correction = False
         self.alignment_source = None
         self.confidence = 0.0
         self.T_slam_to_map = np.eye(4)
         self.last_measurement = None
+        self._last_fuse_time = None
         self.discard_marker_fixes()
         self._generation += 1
-        if self.edge_aligner is not None:
-            self.edge_aligner.clear_mesh()
         self.diagnostics["lidar_aligned"] = False
         self.diagnostics["alignment_source"] = None
 

@@ -86,7 +86,7 @@ from scan_scale import DepthSweep, measure_scale, fit_locator_scale, verify_loca
 from marker_map import (MarkerSurvey, capture_mapped_observation, level_locators_from_view,
                         solve_mapped_observation, validate_layout, save_layout, load_layout, locator_transform,
                         layout_entry, layout_signature, MAX_MARKERS,
-                        MarkerSightings)
+                        MarkerSightings, MappedObservation, steady_rotation)
 
 try:
     from lidar_map_matcher import LidarMapMatcher
@@ -853,6 +853,10 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         self.act_delete.setStatusTip("Remove the loaded scan from the scene")
         self.act_delete.triggered.connect(self._menu_delete_scan)
         file_menu.addAction(self.act_delete)
+        act_reset = QAction("&Reset Scene…", self)
+        act_reset.setStatusTip("Clear the lineup and start Auto lineup again; the scan and Locators stay")
+        act_reset.triggered.connect(self._menu_reset_scene)
+        file_menu.addAction(act_reset)
         # Greyed out with nothing loaded, so the menu says whether there is a
         # scan to delete rather than silently doing nothing.
         file_menu.aboutToShow.connect(self._sync_delete_action)
@@ -912,6 +916,54 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         self._lidar_validation = None
         self._lidar_measurement = None
         print("[Dashboard] 🗑  Scan deleted — scene is empty.")
+
+    def _menu_reset_scene(self):
+        """Reset Scene (button and File menu) — confirm, then redo Auto lineup."""
+        if getattr(self, "map_viewer", None) is None:
+            return
+        if QMessageBox.question(
+                self, "Reset Scene",
+                "Clear the lineup and start Auto lineup again from the beginning?\n\n"
+                "The scan, its placement and scale, and every Locator and marker ID "
+                "stay as they are.\n\n"
+                "FreeD output to Unreal stops until Auto lineup completes.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._reset_scene()
+
+    def _reset_scene(self):
+        """Go back to the start of Auto lineup, keeping the scene.
+
+        The scan, where it sits, its scale and every Locator and marker ID
+        stay: that is the scene the operator built. What goes is the lineup
+        solved on top of it -- the camera's fix on the scan, the fusion state
+        (a RELINEUP hold included) and the trail drawn under it. Auto lineup
+        is then started exactly as ticking its box does, so with three
+        assigned markers the scale check runs first. The camera's own
+        tracking (VIO, the gate and stationary hold) keeps running.
+        """
+        if self._lineup is not None:
+            self._lineup_cancel()
+        if self._scale_sweep is not None:
+            self._end_scale_sweep("Scene reset.")
+        self._cancel_marker_lineup("Scene reset.", failed=False)
+        if self.lidar_matcher is not None:
+            self.lidar_matcher.clear_alignment()
+        engine = self.engine
+        engine.confirm_lineup()
+        engine.transformer.clear_ground_zero()
+        engine.map_aligned = False
+        engine.anchor_requested = False
+        engine.last_marker_solution = None
+        self.smoother.reset()
+        self._lidar_validation = None
+        self._lidar_measurement = None
+        self._image_lineup = None
+        self._ar_overlay = None
+        self.map_viewer.clear_trail()
+        print("[Dashboard] ↺ Scene reset — lineup cleared; starting Auto lineup again.")
+        self._toggle_marker_lineup(True)
 
     def _menu_save_scene(self):
         """File > Save — write the scene the operator has set up.
@@ -1315,7 +1367,18 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         scene = QWidget()
         scene_layout = QVBoxLayout(scene)
         scene_layout.setContentsMargins(4, 4, 0, 0)
-        scene_layout.addWidget(self._hdr("SCENE ALIGNMENT", size=10))
+        scene_header = QHBoxLayout()
+        scene_header.addWidget(self._hdr("SCENE ALIGNMENT", size=10))
+        scene_header.addStretch()
+        self.btn_reset_scene = QPushButton("Reset Scene")
+        self.btn_reset_scene.setStyleSheet(self._AR_BTN_QSS + "QPushButton{padding:3px 10px;}")
+        self.btn_reset_scene.setMinimumWidth(110)
+        self.btn_reset_scene.setToolTip(
+            "Clear the lineup and start Auto lineup again from the beginning. The scan, "
+            "its placement and every Locator stay. Asks first.")
+        self.btn_reset_scene.clicked.connect(self._menu_reset_scene)
+        scene_header.addWidget(self.btn_reset_scene)
+        scene_layout.addLayout(scene_header)
         self.map_viewer = MapViewerWidget()
         self.map_viewer.persp_view.set_camera_edit_locked(True)
         self.map_viewer.file_loaded.connect(self._on_map_loaded)
@@ -1495,8 +1558,11 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         l.setStyleSheet("background:#000; border:1px solid #2a2a3a; border-radius:4px;")
         return l
 
-    def _style_btn(self, on):
-        if on:
+    def _style_btn(self, on, held=False):
+        if on and held:
+            s = ("QPushButton{background:#554424;color:#ffe1a3;border-radius:6px;"
+                 "padding:10px;border:1px solid #b18b42;}")
+        elif on:
             s = ("QPushButton{background:#205943;color:#e0f2e9;border-radius:6px;"
                  "padding:10px;border:1px solid #43866a;}"
                  "QPushButton:hover{background:#2b7055;}")
@@ -1504,13 +1570,30 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
             s = ("QPushButton{background:#b71c1c;color:#fff;border-radius:6px;"
                  "padding:10px;border:2px solid #d50000;}"
                  "QPushButton:hover{background:#d50000;}")
-        self.btn_udp.setStyleSheet(s)
+        self._set_status_style(self.btn_udp, s)
+
+    def _output_mode(self, status=None):
+        if not self.streaming_enabled:
+            return "Paused"
+        engine = self.engine
+        if not engine.predictor.has_pose:
+            return "Waiting"
+        if not engine.fusion.enabled:
+            return "Live" if engine.predictor.age(time.time()) <= engine.stale_timeout else "Held"
+        status = engine.fusion_status() if status is None else status
+        if engine._output_T is None:
+            return "Waiting"
+        if engine._verified_recovery and status["output_allowed"]:
+            return "Recovering"
+        if not status["output_allowed"] or engine._output_held:
+            return "Held"
+        return "Live" if status["validated"] else "Live · unverified"
 
     def _toggle_stream(self):
         self.streaming_enabled = not self.streaming_enabled
-        state = "Enabled" if self.streaming_enabled else "Paused"
+        state = self._output_mode()
         self.btn_udp.setText(f"FreeD output · {state}")
-        self._style_btn(self.streaming_enabled)
+        self._style_btn(self.streaming_enabled, state != "Live")
 
     def _toggle_gnss(self):
         if self.gnss_thread is not None:
@@ -2399,7 +2482,8 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
             state, title, colour = "scaling", "Auto lineup · Measuring scale", "#ebc07d"
         elif self._marker_request is not None:
             state = "searching" if self._marker_busy else "waiting"
-            title = "Auto lineup · Matching scan" if self._marker_busy else "Auto lineup · Waiting"
+            title = ("Auto lineup · Recovering" if self._marker_request.get("recovering") else
+                     "Auto lineup · Matching scan" if self._marker_busy else "Auto lineup · Waiting")
             colour = "#ebc07d"
         else:
             status = self.engine.fusion_status() if status is None else status
@@ -2487,12 +2571,12 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
                              else "Show the marker and surrounding room geometry. Waiting for a fresh detection."),
                             armed=True)
 
-    def _marker_request_changed(self, request):
+    def _marker_request_changed(self, request, check_resync=True):
         if request["matcher"] is not self.lidar_matcher:
             return "The scan changed. Place the locator and arm again."
         if request["generation"] != self.lidar_matcher._generation:
             return "The scan or alignment changed. Arm marker lineup again."
-        if request["resyncs"] != self.engine.gate.resyncs:
+        if check_resync and request["resyncs"] != self.engine.gate.resyncs:
             return "Tracking resynchronized. Wait for stable tracking and arm again."
         if request.get("layout_signature", ()) != layout_signature(self._mapped_marker_records()):
             return "Marker assignments or locator poses changed. Check the layout and enable Auto lineup again."
@@ -2507,14 +2591,48 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
             return "Manual lineup is active. Apply or cancel it before using a marker."
         return ""
 
+    def _start_marker_recovery(self, context):
+        """Retain the surveyed layout; quarantine old work and seek a fresh fix."""
+        self.engine.begin_recovery()
+        matcher = context["matcher"]
+        matcher.clear_alignment()  # invalidates queued/in-flight scan corrections
+        self._lidar_measurement = None
+        self._marker_tracking_job = None
+        self._marker_lock_context = None
+        if self._marker_survey is not None:
+            self._marker_survey.clear()
+        self._marker_request = dict(context, generation=matcher._generation,
+            resyncs=self.engine.gate.resyncs, armed_at=time.monotonic(),
+            last_image=None, last_support=0., recovering=True, recovery_results=[])
+        self._marker_request.pop("continuous", None)
+        self._marker_failed = False
+        self._marker_status("Reacquiring the saved lineup. Show mapped markers and room geometry; "
+                            "output is held until repeated checks agree.", armed=True)
+
     def _poll_marker_lineup(self):
         request = self._marker_request
         context = request if request is not None else self._marker_lock_context
         if context is not None:
-            reason = self._marker_request_changed(context)
+            reason = self._marker_request_changed(context, check_resync=False)
             if reason:
                 self._cancel_marker_lineup(reason)
                 return
+            changed_frame = context["resyncs"] != self.engine.gate.resyncs
+            # Only a lineup that already locked can be lost. An explicit lineup
+            # still being acquired clears RELINEUP itself when it succeeds, and
+            # its Locators may not have had their orientations measured yet.
+            locked = request is None or request.get("recovering")
+            needs_recovery = request is None and self.engine._relineup_required
+            if changed_frame or needs_recovery:
+                if (locked and context.get("records") and self.engine.map_aligned
+                        and self.engine.fusion.enabled):
+                    self._start_marker_recovery(context)
+                    request = context = self._marker_request
+                else:
+                    self._cancel_marker_lineup(
+                        "Tracking resynchronized. Wait for stable tracking and arm again." if changed_frame
+                        else "Camera moved too far while output was held. Enable Auto lineup again.")
+                    return
         if self._marker_busy:
             return
         continuous = request is None
@@ -2525,6 +2643,10 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
             if time.monotonic() - context.get("last_support", 0.) < 1.0 / rate:
                 return
             request = context
+        if request.get("recovering"):
+            rate = max(.1, self.cfg["aruco"].get("marker_support_rate_hz", 2.0))
+            if time.monotonic() - request.get("last_support", 0.) < 1.0 / rate:
+                return
         sample = self._marker_detection_sample
         if sample is None:
             return
@@ -2535,7 +2657,7 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         from marker_lineup import capture_marker_observation, matcher_snapshot
         if request.get("records"):
             records = request["records"]
-            if continuous and "oriented_marker_keys" in request:
+            if (continuous or request.get("recovering")) and "oriented_marker_keys" in request:
                 # An assigned marker hidden during acquisition still has a
                 # hand-entered rotation. It cannot supply corner constraints.
                 known = request["oriented_marker_keys"]
@@ -2553,7 +2675,7 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
             else:
                 self._marker_status(reason)
             return
-        if request.get("records") and not continuous:
+        if request.get("records") and not continuous and not request.get("recovering"):
             observation = self._level_assigned_locators(request, observation)
             if not request.get("orientation_ready", True):
                 self._marker_status(request["level_note"] +
@@ -2594,9 +2716,22 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
             return
         if self._marker_shutdown or self._marker_request is not request:
             return
-        reason = self._marker_request_changed(request)
-        if not reason and time.monotonic() - observation.captured_at > 15.0:
+        reason = self._marker_request_changed(request, check_resync=False)
+        if reason:
+            self._cancel_marker_lineup(reason)
+            return
+        recovering = request.get("recovering", False)
+        if request["resyncs"] != self.engine.gate.resyncs:
+            if recovering:
+                self._start_marker_recovery(request)
+            else:
+                self._cancel_marker_lineup("Tracking resynchronized. Wait for stable tracking and arm again.")
+            return
+        max_age = self.cfg.get("lidar", {}).get("max_measurement_age_s", .6) if recovering else 15.0
+        if not 0 <= time.monotonic() - observation.captured_at <= max_age:
             reason = "Marker solve took too long. Park the rig and try again."
+        if recovering and observation.captured_at <= request["armed_at"]:
+            reason = "Waiting for image and depth captured after tracking recovery started."
         if not reason and (self.engine._last_pose_mono is None
                 or time.monotonic() - self.engine._last_pose_mono > self.stale_timeout
                 or self.engine._pose_rejected):
@@ -2605,22 +2740,71 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
             reason = "Marker lineup failed: " + error
         if not reason and (measurement is None or not measurement.ok):
             reason = "Scan match rejected: " + (measurement.reason if measurement else "no result")
-            for note in (request.get("level_turned"), request.get("level_note")):
+            # The levelling notes describe the original acquisition; repeated
+            # during a recovery they only bury the actual rejection.
+            for note in (() if recovering else (request.get("level_turned"), request.get("level_note"))):
                 if note:
                     reason += " " + note
-            if request.get("records"):
+            if request.get("records") and not recovering:
                 reason += (" Assigned Locator positions are kept fixed on the scan. "
                            "Their orientations are measured from the camera and surrounding surfaces.")
+        if not reason and (np.shape(measurement.T_slam_to_map) != (4, 4)
+                           or not np.isfinite(measurement.T_slam_to_map).all()):
+            reason = "Marker solve returned an invalid camera alignment."
         min_rank = self.cfg.get("fusion", {}).get("min_scan_rank", 3)
         if not reason and measurement.observable_rank < min_rank and len(getattr(measurement, "marker_keys", ())) < 2:
             reason = "Show more room geometry; the scan match does not constrain all position axes."
+        needed = max(3, self.cfg["fusion"].get("recovery_samples", 3))
         if reason:
-            self._cancel_marker_lineup(reason)
+            if recovering:
+                # A view that cannot be verified (markers too oblique, depth
+                # looking out of the scan) is missing evidence, not contrary
+                # evidence, so keep the agreeing checks already collected.
+                # Resetting here meant one poor view in three restarted the
+                # count, and recovery never completed. Accepted checks still
+                # each pass the full scan verification, must agree with each
+                # other, and must arrive within markers_timeout_s of the last.
+                count = len(request["recovery_results"])
+                progress = f"{count}/{needed} consistent checks; last check rejected: " if count else ""
+                self._marker_status("Reacquiring lineup: " + progress + reason + " Waiting for a fresh view.",
+                                    armed=True)
+            else:
+                self._cancel_marker_lineup(reason)
             return
         matcher = request["matcher"]
+        if recovering:
+            results = request["recovery_results"]
+            if results and observation.captured_at <= results[-1].monotonic_timestamp:
+                return
+            measurement.monotonic_timestamp = observation.captured_at
+            if results:
+                distance, angle = matcher._camera_delta(results[0].T_slam_to_map,
+                    measurement.T_slam_to_map, observation.T_slam_depth)
+                cfg = self.cfg["fusion"]
+                if (observation.captured_at - results[-1].monotonic_timestamp > cfg.get("markers_timeout_s", 1.2)
+                        or distance > cfg.get("recovery_consistency_m", .03)
+                        or angle > cfg.get("recovery_consistency_deg", 1.5)):
+                    results.clear()
+            results.append(measurement)
+            if len(results) < needed:
+                self._marker_status(f"Reacquiring lineup: {len(results)}/{needed} consistent marker and scan checks. "
+                                    "Keep mapped markers and room geometry visible.", armed=True)
+                return
         matcher.accept_hint_solution(measurement, source="aruco",
                                      captured_at=observation.captured_at)
-        self.engine.confirm_lineup()
+        if recovering:
+            self._push_map_alignment()
+            for result in results:
+                self.engine.observe_scan(result)
+            if not self.engine.resume_verified_recovery():
+                request.update(generation=matcher._generation, recovery_results=[])
+                self._marker_status("Reacquiring lineup: waiting for fresh camera motion and scan checks.", armed=True)
+                return
+            request = dict(request)
+            request.pop("recovering", None)
+            request.pop("recovery_results", None)
+        else:
+            self.engine.confirm_lineup()
         self._lidar_measurement = measurement
         self.engine.observe_scan(measurement)
         self._push_map_alignment()
@@ -2666,6 +2850,8 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         multiple Locators derive their rotations from their centre geometry.
         """
         measure_all = len(request["records"]) >= 2
+        if measure_all:
+            return self._measure_locator_rotations(request, observation)
         corrections, note = level_locators_from_view(observation, T_display_map=request["rigid"],
                                                      min_error_deg=0. if measure_all else 10.,
                                                      snap_mounts=not measure_all,
@@ -2697,6 +2883,83 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         for line in (request["level_turned"], note):
             if line:
                 print(f"[ArUco] {line}")
+        return observation
+
+    def _measure_locator_rotations(self, request, observation):
+        """Multi-marker lineup: turn each Locator once, from steady views only.
+
+        Recorded 2026-11-14 on the terrace: from a parked camera with two small
+        wall markers near the frame edge and the floor marker almost edge-on,
+        one frame's measurement was 5-9 degrees out. Turning every Locator from
+        it each poll made the joint solve reject the layout ("Registered
+        markers disagree"), and a retry turned them again by as much. Now a
+        marker seen too small or too edge-on is not measured at all, and a
+        Locator is turned only when `orientation_samples` successive frames
+        agree to `orientation_agree_deg` -- then to their mean, and once per
+        lineup. The solve waits for two measured markers in view (or every
+        marker in view), and uses only those: an unmeasured hand-set rotation
+        still never enters it.
+        """
+        aru = self.cfg["aruco"]
+        count = max(1, int(aru.get("orientation_samples", 3)))
+        lines = []
+        corrections, note = level_locators_from_view(
+            observation, T_display_map=request["rigid"], min_error_deg=0., snap_mounts=False,
+            min_marker_px=aru.get("orientation_min_marker_px", 30),
+            max_view_deg=aru.get("orientation_max_view_deg", 65.), log=lines.append)
+        samples = request.setdefault("orientation_samples", {})
+        oriented = set(request.get("oriented_marker_keys", ()))
+        placed = {(m.family, m.marker_id): m.T_map_locator for m in observation.markers}
+        view = self.map_viewer.persp_view
+        owners = {(e["marker"]["dictionary"], e["marker"]["id"]): key
+                  for key, e in view.locator_entries().items() if e["marker"]}
+        turned = request.setdefault("turned_notes", [])
+        changed = False
+        for key, T_map_locator, _, on_wall in corrections:
+            if key in oriented:
+                continue
+            window = samples.setdefault(key, [])
+            window.append(T_map_locator[:3, :3].copy())
+            del window[:-count]
+            rotation = steady_rotation(window, count, aru.get("orientation_agree_deg", 3.))
+            if rotation is None:
+                continue
+            T = T_map_locator.copy()
+            T[:3, :3] = rotation
+            delta = placed[key][:3, :3].T @ rotation
+            degrees = float(np.degrees(np.arccos(np.clip((np.trace(delta) - 1) / 2, -1, 1))))
+            display = request["rigid"] @ T
+            # Preserve the operator's displayed position bit for bit.
+            display[:3, 3] = view.get_locator_transform(owners[key])[:3, 3]
+            self._set_locator_display(owners[key], display)
+            oriented.add(key)
+            changed = True
+            turned.append(f"ID {key[1]} {'upright on its wall' if on_wall else 'flat'} ({degrees:.0f}°)")
+        request["oriented_marker_keys"] = tuple(sorted(oriented))
+        in_view = list(placed)
+        usable = [key for key in in_view if key in oriented]
+        request["orientation_ready"] = len(usable) >= 2 or (bool(usable) and len(usable) == len(in_view))
+        waiting = [str(key[1]) for key in in_view if key not in oriented]
+        if waiting and not request["orientation_ready"]:
+            note = (note + " " if note else "") + (
+                f"Measuring the rotation of marker(s) {', '.join(waiting)}: hold the camera steady "
+                f"for {count} frames.")
+        if changed:
+            for line in lines:
+                print(f"[ArUco] {line}")
+            records = validate_layout(self._mapped_marker_records())
+            request.update(records=records, layout_signature=layout_signature(records))
+            observation = observation.with_layout(records)
+        if note and note != request.get("level_note"):
+            print(f"[ArUco] {note}")
+        request["level_note"] = note
+        request["level_turned"] = ("Turned Locator " + ", ".join(turned) + " to match the camera."
+                                   if turned else "")
+        if changed:
+            print(f"[ArUco] {request['level_turned']}")
+        if request["orientation_ready"] and len(usable) < len(in_view):
+            observation = MappedObservation(tuple(m for m in observation.markers
+                                                  if (m.family, m.marker_id) in oriented))
         return observation
 
     def _adopt_lineup_marker(self, request, observation):
@@ -2770,7 +3033,12 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         self._marker_tracking_job = None
         reason = self._marker_request_changed(request)
         if reason:
-            self._cancel_marker_lineup(reason)
+            if (request["resyncs"] != self.engine.gate.resyncs
+                    and self.engine.fusion.enabled
+                    and not self._marker_request_changed(request, check_resync=False)):
+                self._start_marker_recovery(self._marker_lock_context)
+            else:
+                self._cancel_marker_lineup(reason)
             return
         if error or measurement is None or not measurement.ok:
             self._marker_support_detail = error or (measurement.reason if measurement else "No marker match")
@@ -3039,6 +3307,10 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         matcher = self.lidar_matcher
         if (not self._ar_overlay_on or self._lineup is not None
                 or matcher is None or not matcher.is_aligned):
+            # Drop the last overlay frame too. The display prefers it over
+            # the live picture, so keeping it froze the camera panel on the
+            # moment the lineup was lost -- for the whole of a recovery.
+            self._ar_overlay = None
             return
         self._ar_frame_n += 1
         if self._ar_frame_n % 10:            # ~6 Hz at a 60 Hz refresh
@@ -3600,13 +3872,20 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
             widget.setStyleSheet(stylesheet)
 
     def _refresh_tracked_camera(self):
-        """Draw the same supervised world pose sent to FreeD, including full rotation."""
+        """Draw the live tracked camera in the scan, including full rotation.
+
+        This is the stereo / IMU pose with the lineup applied, the same one
+        the scan overlay uses, so the dot follows the camera even while the
+        FreeD output is held (HOLD / RELINEUP). The dot turns amber while
+        Unreal is not receiving it.
+        """
         viewer = getattr(self, "map_viewer", None)
         if viewer is None:
             return
-        pose = self.engine.camera_pose_ros_corrected()
+        pose = self.engine.camera_pose_ros_live()
         if pose is not None:
-            viewer.update_camera_pose(*pose)
+            position, quaternion, output_live = pose
+            viewer.update_camera_pose(position, quaternion, output_live=output_live)
 
     def _refresh(self):
         sample = self._marker_detection_sample
@@ -3743,7 +4022,9 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
                   "#ebc07d" if state in ("DEGRADED", "ALIGNING", "VERIFYING", "POSE ONLY") else "#ee9a9a")
         self.lbl_session.setText(state.replace("_", " "))
         self._set_status_style(self.lbl_session, self._SESSION_BADGE_CSS.format(bg="#202d3c", fg=colour))
-        mode = "Enabled" if self.streaming_enabled else "Paused"
+        mode = self._output_mode(status)
+        self.btn_udp.setText(f"FreeD output · {mode}")
+        self._style_btn(self.streaming_enabled, mode != "Live")
         self.lbl_status.setText(
             f"{status['reason']}\n"
             f"Motion {self._pose_rate:.1f} Hz  /  FreeD {self._send_rate:.1f} Hz\n"

@@ -203,6 +203,16 @@ class TestSlamPoseSync(VirtualCameraTestCase):
         gui.odometry_callback(self._odom(0, 0, 0, lin=(2.0, 0.0, 0.0)))
         np.testing.assert_allclose(gui.predictor._lin, [2.0, 0.0, 0.0])
 
+    def test_body_frame_twist_is_extrapolated_in_the_world(self):
+        """Isaac's twist is in the camera body frame. Panned 90 degrees left,
+        a dolly forward must advance the prediction along world +Y, not +X."""
+        gui = self._make_gui(max_extrapolation_s=1.0)
+        gui.odometry_callback(self._odom(0, 0, 0, q=q_from_rpy(yaw_deg=90.0),
+                                         lin=(2.0, 0.0, 0.0)))
+        np.testing.assert_allclose(gui.predictor._lin, [0.0, 2.0, 0.0], atol=1e-9)
+        position, _ = gui.predictor.predict(gui.predictor._stamp + 0.5)
+        np.testing.assert_allclose(position, [0.0, 1.0, 0.0], atol=1e-9)
+
     def test_trajectory_accumulates(self):
         gui = self._make_gui()
         for i in range(5):
@@ -680,6 +690,203 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
         self.assertIn('orientations are measured', gui.lbl_marker_lineup.text())
         self.assertNotIn('Clear ID', gui.lbl_marker_lineup.text())
 
+    def _recovery_gui(self):
+        gui, observation, truth, records = self._mapped_gui()
+        gui.engine.fusion.enabled = gui.cfg['fusion']['enabled'] = True
+        gui._finish_marker_lineup((gui._marker_request, observation,
+            self._mapped_measurement(observation, truth), ''))
+        packet = gui.engine.freed_packet()
+        context = gui._marker_lock_context
+        gui._marker_detection_sample = None
+        gui.engine.gate.resyncs += 1
+        gui._poll_marker_lineup()
+        self.assertTrue(gui.btn_marker_lineup.isChecked())
+        self.assertTrue(gui._marker_request['recovering'])
+        self.assertIsNone(gui._marker_lock_context)
+        self.assertFalse(gui.lidar_matcher.is_aligned)
+        self.assertEqual(gui.engine.freed_packet(), packet)
+        return gui, observation, truth, packet, context
+
+    def test_reset_reacquires_with_two_markers_and_preserves_output_continuity(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        from marker_map import MappedObservation
+        with patch('time.monotonic', return_value=100.) as mono, \
+                patch('time.time', return_value=1000.) as wall:
+            gui, observation, truth, packet, context = self._recovery_gui()
+            request = gui._marker_request
+            # During the outage the camera actually travelled 40 cm. Recovery
+            # must require fresh evidence, then slew the old output toward it.
+            moved = observation.T_slam_depth.copy()
+            moved[:3, 3] += [.4, 0, 0]
+            for i in range(1, 4):
+                mono.return_value = 100. + i*.5
+                wall.return_value = 1000. + i*.5
+                gui.engine.accept_pose(moved[:3, 3], matrix_to_quaternion(moved[:3, :3]),
+                    [0,0,0], [0,0,0], stamp=12.+i)
+                seen = MappedObservation(tuple(replace(m, captured_at=mono.return_value,
+                    T_slam_depth=moved, T_slam_image=moved) for m in observation.markers[:2]))
+                result = self._mapped_measurement(seen, truth)
+                gui._finish_marker_lineup((request, seen, result, ''))
+                self.assertEqual(gui.engine.freed_packet(), packet)
+                if i < 3:
+                    self.assertTrue(gui.engine._relineup_required)
+                    self.assertFalse(gui.lidar_matcher.is_aligned)
+            self.assertFalse(gui.engine._relineup_required)
+            self.assertIsNone(gui._marker_request)
+            self.assertIsNotNone(gui._marker_lock_context)
+            self.assertTrue(gui.btn_marker_lineup.isChecked())
+            self.assertEqual(gui._output_mode(), 'Recovering')
+            mono.return_value += .02
+            wall.return_value += .02
+            before = gui.engine._output_T.copy()
+            self.assertNotEqual(gui.engine.freed_packet(), packet)
+            self.assertLessEqual(np.linalg.norm(gui.engine._output_T[:3, 3] - before[:3, 3]), .002001)
+
+    def test_recovery_rejects_duplicate_stale_inconsistent_and_pre_reset_results(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        from marker_map import MappedObservation
+        with patch('time.monotonic', return_value=100.) as mono:
+            gui, observation, truth, packet, old_context = self._recovery_gui()
+            request = gui._marker_request
+            def deliver(at, transform=truth, age=0):
+                mono.return_value = at
+                gui.engine._last_pose_mono = at
+                seen = MappedObservation(tuple(replace(m, captured_at=at-age)
+                                              for m in observation.markers[:2]))
+                result = self._mapped_measurement(seen, transform)
+                gui._finish_marker_lineup((request, seen, result, ''))
+                self.assertEqual(gui.engine.freed_packet(), packet)
+            deliver(100.5)
+            deliver(100.5)  # repeated processing is not another observation
+            self.assertEqual(len(request['recovery_results']), 1)
+            wrong = truth.copy(); wrong[0, 3] += .2
+            deliver(101., wrong)
+            self.assertEqual(len(request['recovery_results']), 1)
+            deliver(102., age=1.)
+            # A stale result is not counted, and is not contrary evidence.
+            self.assertEqual(len(request['recovery_results']), 1)
+            self.assertEqual(request['recovery_results'][0].monotonic_timestamp, 101.)
+            gui._finish_marker_lineup((old_context, observation,
+                self._mapped_measurement(observation, truth), ''))
+            self.assertIs(gui._marker_request, request)
+            self.assertFalse(gui.lidar_matcher.is_aligned)
+            gui.engine.gate.resyncs += 1
+            gui._poll_marker_lineup()
+            self.assertIsNot(gui._marker_request, request)
+            self.assertEqual(gui._marker_request['recovery_results'], [])
+            self.assertTrue(gui.btn_marker_lineup.isChecked())
+
+    def test_a_rejected_view_between_agreeing_checks_does_not_restart_recovery(self):
+        """Recorded 2026-11-14: checks reached 1/3 and 2/3, and every poor view
+        in between (markers oblique, depth out of the doorway) reset the count,
+        so recovery never completed. A rejected view adds no evidence; the
+        agreeing checks still count, and too long a gap still restarts."""
+        from dataclasses import replace
+        from unittest.mock import patch
+        from lidar_map_matcher import MapMeasurement
+        from marker_map import MappedObservation
+        with patch('time.monotonic', return_value=100.) as mono:
+            gui, observation, truth, packet, _ = self._recovery_gui()
+            request = gui._marker_request
+            def deliver(at, ok=True):
+                mono.return_value = at
+                gui.engine._last_pose_mono = at
+                seen = MappedObservation(tuple(replace(m, captured_at=at)
+                                              for m in observation.markers[:2]))
+                result = (self._mapped_measurement(seen, truth) if ok else
+                          MapMeasurement(reason="Survey pose has 60% depth agreement, median miss 70 mm"))
+                gui._finish_marker_lineup((request, seen, result, ''))
+            deliver(100.5)
+            deliver(101.0, ok=False)
+            self.assertEqual(len(request['recovery_results']), 1)
+            self.assertIn('1/3', gui.lbl_marker_lineup.text())
+            self.assertIn('median miss 70 mm', gui.lbl_marker_lineup.text())
+            self.assertNotIn('Turned Locator', gui.lbl_marker_lineup.text())
+            deliver(101.5)
+            deliver(102.0, ok=False)
+            self.assertTrue(gui.engine._relineup_required)
+            self.assertEqual(gui.engine.freed_packet(), packet)
+            deliver(102.5)
+            self.assertFalse(gui.engine._relineup_required)
+            self.assertIsNone(gui._marker_request)
+            self.assertIsNotNone(gui._marker_lock_context)
+
+    def test_recovery_checks_too_far_apart_in_time_start_the_count_again(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        from marker_map import MappedObservation
+        with patch('time.monotonic', return_value=100.) as mono:
+            gui, observation, truth, packet, _ = self._recovery_gui()
+            request = gui._marker_request
+            for at in (100.5, 101.0, 105.0):
+                mono.return_value = at
+                gui.engine._last_pose_mono = at
+                seen = MappedObservation(tuple(replace(m, captured_at=at)
+                                              for m in observation.markers[:2]))
+                gui._finish_marker_lineup((request, seen, self._mapped_measurement(seen, truth), ''))
+            self.assertEqual(len(request['recovery_results']), 1)
+            self.assertTrue(gui.engine._relineup_required)
+
+    def test_recovery_waits_through_occlusion_but_scene_edits_cancel_it(self):
+        from unittest.mock import patch
+        with patch('time.monotonic', return_value=100.) as mono:
+            gui, observation, truth, packet, _ = self._recovery_gui()
+            request = gui._marker_request
+            for _ in range(10):
+                mono.return_value += .1
+                gui._poll_marker_lineup()  # no markers visible
+                self.assertTrue(gui.btn_marker_lineup.isChecked())
+                self.assertEqual(gui.engine.freed_packet(), packet)
+            gui.map_viewer.persp_view._edit_channel(0, 2.)
+            gui._poll_marker_lineup()
+            self.assertFalse(gui.btn_marker_lineup.isChecked())
+            self.assertIsNone(gui._marker_request)
+
+    def test_output_mode_distinguishes_held_packets_from_live_tracking(self):
+        from unittest.mock import patch
+        with patch('time.monotonic', return_value=100.):
+            gui, observation, truth, packet, _ = self._recovery_gui()
+            self.assertEqual(gui._output_mode(), 'Held')
+            gui.streaming_enabled = False
+            self.assertEqual(gui._output_mode(), 'Paused')
+
+    def test_locked_lineup_that_must_be_redone_reacquires_by_itself(self):
+        """'Camera moved too far during hold' must not leave the lineup dead."""
+        from unittest.mock import patch
+        with patch('time.monotonic', return_value=100.):
+            gui, observation, truth, _ = self._mapped_gui()
+            gui.engine.fusion.enabled = gui.cfg['fusion']['enabled'] = True
+            gui._finish_marker_lineup((gui._marker_request, observation,
+                self._mapped_measurement(observation, truth), ''))
+            gui._marker_detection_sample = None
+            gui.engine._relineup_required = True
+            gui._poll_marker_lineup()
+            self.assertTrue(gui.btn_marker_lineup.isChecked())
+            self.assertTrue(gui._marker_request['recovering'])
+
+    def test_explicit_lineup_is_not_cancelled_by_a_pending_relineup(self):
+        """Arming Auto lineup is how the operator answers RELINEUP; the
+        pending RELINEUP must not cancel that same lineup."""
+        gui, _, _ = self._marker_gui()
+        request = gui._marker_request
+        self.assertIsNotNone(request)
+        gui._marker_detection_sample = None
+        gui.engine._relineup_required = True
+        gui._poll_marker_lineup()
+        self.assertTrue(gui.btn_marker_lineup.isChecked())
+        self.assertIs(gui._marker_request, request)
+        self.assertFalse(request.get('recovering', False))
+
+    @staticmethod
+    def _steady_frames(gui, mono, detections, times):
+        """Show the markers for a few frames: Locator rotations need steady views."""
+        for at in times:
+            mono.return_value = at
+            gui._marker_detection_sample = (detections, 11., at, (848, 480))
+            gui._poll_marker_lineup()
+
     def test_mapped_acquisition_and_live_support_use_background_joint_solver(self):
         from unittest.mock import patch, Mock
         from test_marker_map import room_fixture
@@ -689,11 +896,13 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
             gui.marker_lineup_finished.connect(gui._finish_marker_lineup)
             def run_inline(**kwargs):
                 return Mock(start=kwargs['target'])
-            mono.return_value = 100.05
             detections = [(m.family, m.marker_id, m.corners) for m in observation.markers]
-            gui._marker_detection_sample = (detections, 11., 100.05, (848,480))
             with patch('dashboard.threading.Thread', side_effect=run_inline), \
                     patch('dashboard.solve_mapped_observation', return_value=measurement) as solve:
+                self._steady_frames(gui, mono, detections, (100.01, 100.03))
+                solve.assert_not_called()
+                mono.return_value = 100.05
+                gui._marker_detection_sample = (detections, 11., 100.05, (848,480))
                 gui._poll_marker_lineup()
                 solve.assert_called_once()
                 self.assertEqual(len(solve.call_args.args[0].markers), 3)
@@ -722,13 +931,16 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
         with patch('time.monotonic', return_value=100.) as mono:
             gui, observation, truth, records = self._mapped_gui(room_fixture({1: (0, 0, 0), 2: (90, 0, 0)}))
             request = gui._marker_request
-            mono.return_value = 100.05
             detections = [(m.family, m.marker_id, m.corners) for m in observation.markers]
-            gui._marker_detection_sample = (detections, 11., 100.05, (848, 480))
             with patch('dashboard.threading.Thread', side_effect=lambda **kw: Mock(start=kw['target'])), \
                     patch('dashboard.solve_mapped_observation',
                           return_value=MapMeasurement(reason="Survey pose has 40% depth agreement")) as solve:
                 gui.marker_lineup_finished.connect(gui._finish_marker_lineup)
+                self._steady_frames(gui, mono, detections, (100.01, 100.03))
+                solve.assert_not_called()
+                self.assertIn('waiting to measure their orientations', gui.lbl_marker_lineup.text())
+                mono.return_value = 100.05
+                gui._marker_detection_sample = (detections, 11., 100.05, (848, 480))
                 gui._poll_marker_lineup()
         placed = {r['id']: locator_transform(r) for r in gui._mapped_marker_records()}
         for fid, (position, _) in ROOM_MARKERS.items():
@@ -763,6 +975,65 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
             for key, entry in gui.map_viewer.persp_view.locator_entries().items():
                 np.testing.assert_array_equal(entry['transform'][:3, 3], before[key]['transform'][:3, 3])
 
+    def _locator_rotations(self, gui):
+        return {e['marker']['id']: e['transform'][:3, :3].copy()
+                for e in gui.map_viewer.persp_view.locator_entries().values() if e['marker']}
+
+    def test_jittering_rotation_measurements_never_turn_a_locator(self):
+        """Recorded 2026-11-14: from a poor view each frame's measured rotation
+        was 5-9 degrees out, and turning Locators from it made the layout
+        disagree. Frames that do not agree must leave the Locators alone."""
+        from unittest.mock import patch
+        import dashboard as dash
+        from test_marker_map import room_fixture
+        real = dash.level_locators_from_view
+        flip = [1.]
+        def jitter(*args, **kwargs):
+            corrections, note = real(*args, **kwargs)
+            flip[0] = -flip[0]
+            turn = rpy_to_matrix(0, 0, np.radians(4.) * flip[0])
+            out = []
+            for key, T, degrees, on_wall in corrections:
+                T = T.copy()
+                T[:3, :3] = T[:3, :3] @ turn
+                out.append((key, T, degrees, on_wall))
+            return out, note
+        with patch('time.monotonic', return_value=100.) as mono:
+            gui, observation, _, _ = self._mapped_gui(room_fixture({1: (0, 0, 0), 2: (90, 0, 0)}))
+            before = self._locator_rotations(gui)
+            detections = [(m.family, m.marker_id, m.corners) for m in observation.markers]
+            with patch('dashboard.level_locators_from_view', side_effect=jitter), \
+                    patch('dashboard.solve_mapped_observation') as solve:
+                self._steady_frames(gui, mono, detections, [100.01 + .02 * i for i in range(8)])
+                solve.assert_not_called()
+            for fid, rotation in self._locator_rotations(gui).items():
+                np.testing.assert_array_equal(rotation, before[fid])
+            self.assertIn('Measuring the rotation of marker(s)', gui.lbl_marker_lineup.text())
+            self.assertTrue(gui.btn_marker_lineup.isChecked())
+
+    def test_edge_on_marker_is_not_turned_and_the_solve_uses_the_measured_ones(self):
+        from unittest.mock import patch, Mock
+        from lidar_map_matcher import MapMeasurement
+        from test_marker_map import room_fixture
+        with patch('time.monotonic', return_value=100.) as mono:
+            gui, observation, _, _ = self._mapped_gui(room_fixture({1: (0, 0, 0), 2: (90, 0, 0)}))
+            # Marker 3 is seen 50 degrees off face-on in this fixture.
+            gui.cfg['aruco']['orientation_max_view_deg'] = 40.
+            before = self._locator_rotations(gui)
+            request = gui._marker_request
+            detections = [(m.family, m.marker_id, m.corners) for m in observation.markers]
+            with patch('dashboard.threading.Thread', side_effect=lambda **kw: Mock(start=kw['target'])), \
+                    patch('dashboard.solve_mapped_observation',
+                          return_value=MapMeasurement(reason="not finished here")) as solve:
+                self._steady_frames(gui, mono, detections, (100.01, 100.03, 100.05))
+                solve.assert_called_once()
+            self.assertEqual(sorted(m.marker_id for m in solve.call_args.args[0].markers), [1, 2])
+            np.testing.assert_array_equal(self._locator_rotations(gui)[3], before[3])
+            self.assertGreater(np.degrees(np.arccos(np.clip(
+                (np.trace(before[1].T @ self._locator_rotations(gui)[1]) - 1) / 2, -1, 1))), 45)
+            self.assertIn('Marker(s) 3 are too small or too edge-on', request['level_note'])
+            self.assertNotIn(3, [key[1] for key in request['oriented_marker_keys']])
+
     def test_orientation_measurement_preserves_exact_displayed_centres(self):
         from test_marker_map import room_fixture
         from marker_map import MappedObservation
@@ -778,7 +1049,8 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
         request = dict(gui._marker_request, rigid=rigid)
         observation = MappedObservation(tuple(replace(m, up_map=np.array([0., 0., 1.]))
                                                for m in observation.markers))
-        gui._level_assigned_locators(request, observation)
+        for _ in range(3):      # rotations are applied from steady frames only
+            gui._level_assigned_locators(request, observation)
         self.assertTrue(request['orientation_ready'])
         for key, entry in view.locator_entries().items():
             np.testing.assert_array_equal(entry['transform'][:3, 3], before[key]['transform'][:3, 3])
@@ -1146,6 +1418,93 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
         self.assertEqual(list(view.locator_entries()), list(before))
         self.assertEqual(gui._map_path, scan)
         self.assertIsNone(gui._pending_scene)
+
+    def test_reset_scene_keeps_the_scene_and_restarts_auto_lineup(self):
+        from unittest.mock import patch
+        from dashboard import QMessageBox
+        gui, obs, truth = self._marker_gui()
+        self._install_verified_marker(gui, obs, truth)
+        viewer, view = gui.map_viewer, gui.map_viewer.persp_view
+        gui._map_path = "/scans/room.obj"
+        map_cloud = gui.lidar_matcher.map_cloud
+        viewer.set_alignment(1.5, -2., .25, 0., 0., 30., .02)
+        gui._align_rigid()
+        gui._push_map_alignment()
+        moved = np.eye(4)
+        moved[:3, 3] = [.1, .2, .3]
+        view.set_display_transform("trail", moved)
+        view.duplicate_locator()
+        view.set_locator_transform(moved)
+        gui._on_locator_moved(view.get_locator_transform())    # as dragging it does
+        viewer.update_camera_pose((.4, .5, .6), (0, 0, 0, 1))
+        gui._toggle_marker_lineup(False)           # lineup done, box unticked
+        gui.engine._relineup_required = True       # stuck: camera moved during a hold
+        self.assertTrue(gui.engine.is_anchored)
+        self.assertTrue(gui.lidar_matcher.is_aligned)
+        scene = (view.locator_entries(), view._active_locator_id, viewer.T_align.copy(),
+                 viewer.alignment_scale, view.get_display_transform("trail"),
+                 gui.engine.anchor_target.copy())
+
+        # Answering No leaves everything as it was.
+        with patch('dashboard.QMessageBox.question', return_value=QMessageBox.No):
+            gui._menu_reset_scene()
+        self.assertTrue(gui.engine.is_anchored)
+        self.assertTrue(gui.engine._relineup_required)
+        self.assertFalse(gui.btn_marker_lineup.isChecked())
+
+        with patch('dashboard.QMessageBox.question', return_value=QMessageBox.Yes):
+            gui._menu_reset_scene()
+        # The scene stays: scan, placement, scale, Locators, display offsets.
+        entries, active, T_align, scale, trail, anchor = scene
+        self.assertIs(gui.lidar_matcher.map_cloud, map_cloud)
+        self.assertEqual(gui._map_path, "/scans/room.obj")
+        self.assertEqual(list(view.locator_entries()), list(entries))
+        for key, entry in entries.items():
+            np.testing.assert_allclose(view.locator_entries()[key]["transform"], entry["transform"])
+        self.assertEqual(view._active_locator_id, active)
+        np.testing.assert_allclose(viewer.T_align, T_align)
+        self.assertAlmostEqual(viewer.alignment_scale, scale)
+        np.testing.assert_allclose(view.get_display_transform("trail"), trail)
+        np.testing.assert_allclose(gui.engine.anchor_target, anchor)
+        # The lineup goes, RELINEUP with it.
+        self.assertFalse(gui.lidar_matcher.is_aligned)
+        self.assertFalse(gui.engine.is_anchored)
+        self.assertFalse(gui.engine.map_aligned)
+        self.assertFalse(gui.engine._relineup_required)
+        self.assertEqual(len(viewer._trail), 0)
+        # Auto lineup is armed again, as ticking its box does.
+        self.assertTrue(gui.btn_marker_lineup.isChecked())
+        self.assertIsNotNone(gui._marker_request)
+        self.assertEqual(gui._marker_request["generation"], gui.lidar_matcher._generation)
+        self.assertIn("Waiting for a fresh detection", gui.lbl_marker_lineup.text())
+        # Tracking carries on, but nothing goes to Unreal until the new lineup.
+        T = obs.T_slam_depth
+        gui.engine.accept_pose(T[:3, 3] + [.01, 0, 0], matrix_to_quaternion(T[:3, :3]),
+                               [0, 0, 0], [0, 0, 0], stamp=20.)
+        self.assertEqual(gui.engine.fusion_status()["state"], "ALIGNING")
+        self.assertIsNone(gui.engine.freed_packet())
+        # And the marker lineup can complete from here.
+        self._install_verified_marker(gui, obs, truth)
+        self.assertTrue(gui.engine.is_anchored)
+        self.assertTrue(gui.lidar_matcher.is_aligned)
+
+    def test_reset_scene_with_three_markers_starts_with_the_scale_check(self):
+        gui, truth, measure, show_markers = self._marker_scale_gui(
+            {1: (.006, -.004, .003), 2: (-.005, .003, -.004), 3: (.004, .007, 0.)})
+        view = gui.map_viewer.persp_view
+        before = view.locator_entries()
+        gui._reset_scene()
+        self.assertIsNone(gui._marker_request)      # waits for the scale result
+        self.assertIsNotNone(gui._scale_sweep)
+        self.assertEqual(gui.btn_marker_lineup.text(), "Auto lineup · Measuring scale")
+        self.assertEqual(gui.btn_marker_scale.text(), "Stop and measure")
+        self.assertEqual(list(view.locator_entries()), list(before))
+        # Reset again mid-measurement: the sweep starts over rather than finishing.
+        first = gui._scale_sweep
+        gui._reset_scene()
+        self.assertIsNot(gui._scale_sweep, first)
+        self.assertEqual(gui.btn_marker_lineup.text(), "Auto lineup · Measuring scale")
+        measure.assert_not_called()
 
     def test_bad_scene_files_change_nothing(self):
         import json
@@ -1565,6 +1924,43 @@ class TestMarkerAssistedLineup(VirtualCameraTestCase):
             np.testing.assert_allclose(gui.map_viewer.cam_pose, previous, atol=1e-12)
             gui._refresh_marker_indicator()
             self.assertEqual(gui.btn_marker_lineup.property("lineupState"), "held")
+
+    def test_dot_keeps_following_camera_while_freed_waits_for_relineup(self):
+        from unittest.mock import patch
+        with patch("time.monotonic", return_value=100.) as mono, \
+                patch("time.time", return_value=1000.) as wall:
+            gui, obs, truth = self._marker_gui()
+            self._install_verified_marker(gui, obs, truth)
+            gui._marker_detection_sample = None
+
+            def move(i):
+                mono.return_value = 100. + i * .04
+                wall.return_value = 1000. + i * .04
+                moved = np.eye(4)
+                moved[:3, 3] = [i * .08, 0., 0.]
+                raw = obs.T_slam_depth @ moved
+                gui.engine.accept_pose(raw[:3, 3], matrix_to_quaternion(raw[:3, :3]),
+                                       [0, 0, 0], [0, 0, 0], stamp=11. + i * .04)
+                return raw
+
+            move(1)
+            packet = gui.engine.freed_packet()
+            gui._refresh_tracked_camera()
+            self.assertFalse(gui.map_viewer.persp_view.cam_output_held)
+            # A stall long enough to hold, then the camera turns up 40 cm on.
+            mono.return_value += 1.
+            wall.return_value += 1.
+            gui.engine.freed_packet()
+            for i in range(30, 40):
+                raw = move(i)
+                self.assertEqual(gui.engine.freed_packet(), packet)
+                self.assertEqual(gui.engine.fusion_status()["state"], "RELINEUP")
+                gui.map_viewer._last_view_push = 0.0
+                gui._refresh_tracked_camera()
+                expected = gui.engine.transformer._zero @ raw @ gui.engine.transformer._rig
+                np.testing.assert_allclose(gui.map_viewer.persp_view._cam_pos,
+                                           expected[:3, 3], atol=1e-9)
+                self.assertTrue(gui.map_viewer.persp_view.cam_output_held)
 
 
 

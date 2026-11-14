@@ -116,6 +116,89 @@ class EngineTests(unittest.TestCase):
             self.check()
         self.assertNotEqual(self.e.freed_packet(), packet)
 
+    def test_verified_reacquisition_preserves_output_then_slews_without_teleport(self):
+        packet = self.ready()
+        self.e.begin_recovery()
+        self.pose(1.0)
+        self.assertEqual(self.e.freed_packet(), packet)
+        self.assertFalse(self.e.resume_verified_recovery())
+        for _ in range(3):
+            self.pose(1.0)
+            self.check()
+        self.assertEqual(self.e.freed_packet(), packet)
+        self.assertTrue(self.e.resume_verified_recovery())
+        self.assertEqual(self.e.freed_packet(), packet)
+        previous = self.e._output_T.copy()
+        self.pose(1.0)
+        self.e.freed_packet()
+        step = np.linalg.norm(self.e._output_T[:3, 3] - previous[:3, 3])
+        self.assertGreater(step, 0.)
+        self.assertLessEqual(step, self.cfg['fusion']['recovery_slew_m_s'] * .02 + 1e-9)
+        self.assertFalse(self.e._relineup_required)
+        # A new outage revokes the exception for the previously verified fix.
+        self.clock.t += 1.
+        held = self.e.freed_packet()
+        self.assertFalse(self.e._verified_recovery)
+        self.pose(2.0)
+        self.assertEqual(self.e.freed_packet(), held)
+        self.assertEqual(self.e.fusion_status()['state'], 'RELINEUP')
+
+    def test_gnss_and_replayed_scan_cannot_release_recovery(self):
+        self.ready()
+        self.e.begin_recovery()
+        self.pose(1.)
+        measurement = self.check()
+        for _ in range(5):
+            self.e.observe_scan(measurement)
+            self.pose(1.)
+            self.e.fusion.observe('gnss', True, self.clock.t)
+        self.assertFalse(self.e.resume_verified_recovery())
+
+    def test_tracking_resync_invalidates_pose_history_for_image_pairing(self):
+        self.e.gate.enabled = True
+        self.e.gate.max_consecutive_rejects = 2
+        self.pose()
+        old_stamp = self.clock.t
+        self.pose(2.)
+        self.pose(2.)
+        self.assertEqual(self.e.gate.resyncs, 1)
+        self.assertIsNone(self.e.pose_at(old_stamp))
+
+    def test_live_dot_follows_camera_while_output_waits_for_relineup(self):
+        packet = self.ready()
+        position, _, live = self.e.camera_pose_ros_live()
+        np.testing.assert_allclose(position, (0, 0, 0))
+        self.assertTrue(live)
+        self.clock.t += 2.0
+        self.e.freed_packet()
+        for i in range(10):
+            x = 1.0 + i * .05
+            self.pose(x)
+            self.check()
+            self.assertEqual(self.e.freed_packet(), packet)
+            self.assertEqual(self.e.fusion_status()["state"], "RELINEUP")
+            # Unreal stays held; the 3D view keeps following the camera.
+            np.testing.assert_allclose(self.e.camera_pose_ros_corrected()[0], (0, 0, 0))
+            position, _, live = self.e.camera_pose_ros_live()
+            np.testing.assert_allclose(position, (x, 0, 0))
+            self.assertFalse(live)
+        self.e.confirm_lineup()
+        for _ in range(3):
+            self.pose(2.0)
+            self.check()
+        self.e.freed_packet()
+        position, _, live = self.e.camera_pose_ros_live()
+        np.testing.assert_allclose(position, self.e.camera_pose_ros_corrected()[0])
+        self.assertTrue(live)
+
+    def test_live_dot_moves_before_lineup_but_is_not_output(self):
+        self.pose(0.3)
+        self.assertEqual(self.e.fusion_status()["state"], "ALIGNING")
+        self.assertIsNone(self.e.camera_pose_ros_corrected())
+        position, _, live = self.e.camera_pose_ros_live()
+        np.testing.assert_allclose(position, (0.3, 0, 0))
+        self.assertFalse(live)
+
     def test_small_recovery_is_slew_limited(self):
         self.ready()
         self.clock.t += 2.0

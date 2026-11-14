@@ -474,6 +474,32 @@ class LocatorLevellingTests(unittest.TestCase):
         corrections, note = level_locators_from_view(obs)
         return {key[1]: (T, error, on_wall) for key, T, error, on_wall in corrections}, note
 
+    def test_small_or_edge_on_markers_are_not_measured(self):
+        obs, _, _ = room_fixture({}, noise_px=.1)
+        # In this view marker 3 is 50 degrees off face-on, 1 and 2 under 30.
+        corrections, note = level_locators_from_view(obs, min_error_deg=0., snap_mounts=False,
+                                                     max_view_deg=40.)
+        self.assertEqual(sorted(key[1] for key, *_ in corrections), [1, 2])
+        self.assertIn('Marker(s) 3 are too small or too edge-on', note)
+        # All three squares are 39-44 px across.
+        corrections, note = level_locators_from_view(obs, min_error_deg=0., snap_mounts=False,
+                                                     min_marker_px=50)
+        self.assertEqual(corrections, [])
+        self.assertIn('Marker(s) 1, 2, 3 are too small or too edge-on', note)
+
+    def test_steady_rotation_needs_agreeing_frames_and_returns_their_mean(self):
+        from marker_map import steady_rotation
+        base = rpy_to_matrix(0, np.radians(90), 0)
+        def turn(deg):
+            return base @ rpy_to_matrix(0, 0, np.radians(deg))
+        def apart(a, b):
+            return np.degrees(np.arccos(np.clip((np.trace(a.T @ b) - 1) / 2, -1, 1)))
+        self.assertIsNone(steady_rotation([turn(0), turn(1)], 3, 3.))
+        self.assertLess(apart(steady_rotation([turn(-1), turn(0), turn(1)], 3, 3.), base), 1e-6)
+        self.assertIsNone(steady_rotation([turn(-4), turn(4), turn(0)], 3, 3.))
+        # Only the most recent frames count: an early bad one ages out.
+        self.assertLess(apart(steady_rotation([turn(20), turn(0), turn(.5), turn(1)], 3, 3.), turn(.5)), 1e-6)
+
     def test_measured_orientations_ignore_all_entered_angles_including_small_errors(self):
         reference = None
         for rotations in ({}, {1: (0, -85, 4), 3: (2, 3, 35)},

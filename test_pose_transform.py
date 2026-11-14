@@ -579,6 +579,39 @@ class TestPoseGate(unittest.TestCase):
         ok, reason = self.gate.check((0.01, 0, 0), self.q, 0.011)
         self.assertTrue(ok, reason)
 
+    def test_real_motion_survives_dropped_frames_without_absorbing_travel(self):
+        gate = pt.PoseGate(max_jump_m=.05, max_speed_m_s=3.)
+        for t in (0., .033, .066, .199, .232, .410):
+            position, _, rejected, reason = gate.filter((.5*t, 0, 0), self.q, t)
+            self.assertFalse(rejected, reason)
+            np.testing.assert_allclose(position, (.5*t, 0, 0))
+        self.assertEqual(gate.resyncs, 0)
+
+    def test_rejected_jump_cannot_expand_its_allowance_by_waiting(self):
+        gate = pt.PoseGate(max_jump_m=.05, max_speed_m_s=3., max_consecutive_rejects=100)
+        gate.check((0, 0, 0), self.q, 0.)
+        for i in range(1, 30):
+            accepted, reason = gate.check((.4, 0, 0), self.q, i*.01)
+            self.assertFalse(accepted, reason)
+
+    def test_long_outage_still_rejects_large_unverified_displacement(self):
+        gate = pt.PoseGate(max_jump_m=.05, max_speed_m_s=3.)
+        gate.check((0, 0, 0), self.q, 0.)
+        self.assertFalse(gate.check((2., 0, 0), self.q, 10.)[0])
+
+    def test_rotated_tracking_reset_keeps_subsequent_translation_in_the_same_world(self):
+        gate = pt.PoseGate(max_jump_m=.05, max_speed_m_s=3., max_consecutive_rejects=2)
+        gate.filter((0, 0, 0), self.q, 0.)
+        rotated = matrix_to_quaternion(rpy_to_matrix(0, 0, math.pi/2))
+        gate.filter((10, 0, 0), rotated, .02)
+        p, q, _, _ = gate.filter((10, 0, 0), rotated, .04)
+        np.testing.assert_allclose(p, (0, 0, 0), atol=1e-9)
+        np.testing.assert_allclose(quaternion_to_matrix(q), np.eye(3), atol=1e-9)
+        # Raw +Y is now the original world's +X, following the 90-degree reset.
+        p, _, rejected, _ = gate.filter((10, .02, 0), rotated, .06)
+        self.assertFalse(rejected)
+        np.testing.assert_allclose(p, (.02, 0, 0), atol=1e-9)
+
     def test_metre_scale_jump_is_rejected(self):
         """The exact failure measured on hardware: 1254 mm in one frame."""
         self.gate.check((0, 0, 0), self.q, 0.0)

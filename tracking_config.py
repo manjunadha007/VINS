@@ -114,6 +114,7 @@ DEFAULTS = {
         "gate_max_speed_m_s": 3.0,
         "gate_max_angular_deg_s": 900.0,
         "gate_max_jump_m": 0.05,
+        "gate_max_gap_s": 0.2,          # bounded travel allowance for delayed frames
         "gate_max_consecutive_rejects": 15,
 
         # Stationary hold (ZUPT). With the rig physically still, pure visual
@@ -152,6 +153,15 @@ DEFAULTS = {
         "auto_place_tolerance_m": 0.03,
         "auto_place_tolerance_deg": 6.0,
         "auto_place_min_marker_px": 24,
+        # Auto lineup with 2+ assigned Locators measures each one's rotation
+        # from the camera. It turns a Locator only once this many successive
+        # frames agree to within orientation_agree_deg, and never from a
+        # marker smaller than orientation_min_marker_px across or seen more
+        # than orientation_max_view_deg off face-on.
+        "orientation_samples": 3,
+        "orientation_agree_deg": 3.0,
+        "orientation_min_marker_px": 30,
+        "orientation_max_view_deg": 65.0,
         # Depth cross-check on the marker solve. Four coplanar corners are
         # pose-ambiguous, so a mono PnP can silently settle on the mirrored
         # solution — and a flipped anchor takes the whole virtual set with it.
@@ -259,6 +269,8 @@ DEFAULTS = {
         "allow_vio_fallback": True,     # fresh aligned camera motion continues without scan support
         "single_source_grace_s": 1.0,   # used only when allow_vio_fallback is false
         "recovery_samples": 3,
+        "recovery_consistency_m": 0.03,
+        "recovery_consistency_deg": 1.5,
         "min_scan_rank": 3,
         "depth_pose_tolerance_s": 0.035,
         "depth_timeout_s": 0.5,
