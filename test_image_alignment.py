@@ -307,10 +307,10 @@ class TestEdgeAligner(unittest.TestCase):
     def test_overlay_draws_edges_on_the_frame(self):
         a = self._aligner()
         gray = self._picture(self.truth)
-        canvas = a.overlay(gray, self.K, self.truth)
+        canvas = a.overlay(gray, self.K, self.truth, opacity=1.0)
         self.assertIsNotNone(canvas)
         self.assertEqual(canvas.shape[2], 3)
-        self.assertEqual(canvas.shape[1], a.work_width)
+        self.assertEqual(canvas.shape[:2], gray.shape)
         painted = np.count_nonzero(np.all(canvas == (0, 255, 255), axis=2))
         self.assertGreater(painted, 50, "no scan edges drawn")
 
@@ -322,6 +322,75 @@ class TestEdgeAligner(unittest.TestCase):
         s = a.score(self._picture(self.truth), self.K, self.truth)
         self.assertIsNotNone(s)
         self.assertGreater(s["score"], 0.4)
+
+
+@unittest.skipUnless(_AVAILABLE, "needs open3d + cv2 (run in the container)")
+class TestWireframeOverlay(unittest.TestCase):
+    """Check real mesh visibility and compositing, without camera hardware."""
+
+    K = np.array([[100., 0., 100.], [0., 100., 80.], [0., 0., 1.]])
+    T = invert_transform(T_BODY_OPTICAL)  # optical camera at the map origin
+    V = np.array([[-1., -1., 2.], [1., -1., 2.],
+                  [1., 1., 2.], [-1., 1., 2.]])
+    F = np.array([[0, 2, 1], [0, 3, 2]], dtype=np.int32)  # face the camera
+
+    def setUp(self):
+        self.aligner = EdgeAligner({"image_align_width": 32,
+                                    "image_align_min_edges": 10000})
+        self.assertTrue(self.aligner.set_mesh(self.V, self.F))
+        self.frame = np.full((160, 200), 100, dtype=np.uint8)
+        self.base = np.repeat(self.frame[:, :, None], 3, axis=2)
+
+    def render(self, opacity=1.0):
+        return self.aligner.overlay(self.frame, self.K, self.T, opacity=opacity)
+
+    def test_coplanar_triangle_diagonal_is_visible_at_camera_resolution(self):
+        rendered = self.render()
+        self.assertEqual(rendered.shape, self.base.shape)
+        # The shared diagonal is a mesh edge, but has no depth/normal crease.
+        np.testing.assert_array_equal(rendered[80, 100], [0, 255, 255])
+        np.testing.assert_array_equal(rendered[55, 100], self.base[55, 100])
+        np.testing.assert_array_equal(rendered[5, 5], self.base[5, 5])
+
+    def test_backfaces_are_culled(self):
+        self.aligner.set_mesh(self.V, self.F[:, ::-1])
+        np.testing.assert_array_equal(self.render(), self.base)
+
+    def test_hidden_triangles_do_not_draw_through_the_front_surface(self):
+        front = self.render()
+        # Same projected square behind the first one, with the other diagonal.
+        self.aligner.set_mesh(np.vstack([self.V, self.V * 2]),
+                              np.vstack([self.F, [[4, 7, 5], [5, 7, 6]]]))
+        np.testing.assert_array_equal(self.render(), front)
+
+    def test_transparency_endpoints_and_half_blend(self):
+        np.testing.assert_array_equal(self.render(opacity=0.0), self.base)
+        opaque = self.render()
+        half = self.render(opacity=0.5)
+        np.testing.assert_allclose(half, (self.base.astype(float) + opaque) / 2,
+                                   atol=1)
+        np.testing.assert_array_equal(self.frame, np.full((160, 200), 100))
+
+    def test_colour_camera_frame_is_preserved(self):
+        self.frame = self.base.copy()
+        self.frame[:, :, 2] = 180
+        original = self.frame.copy()
+        np.testing.assert_array_equal(self.render(opacity=0), original)
+        np.testing.assert_array_equal(self.render()[55, 100], original[55, 100])
+        np.testing.assert_array_equal(self.frame, original)
+
+    def test_out_of_range_and_behind_camera_geometry_is_not_drawn(self):
+        for depth in (-2.0, 0.01, 20.0):
+            with self.subTest(depth=depth):
+                vertices = self.V.copy()
+                vertices[:, 2] = depth
+                self.aligner.set_mesh(vertices, self.F)
+                np.testing.assert_array_equal(self.render(), self.base)
+
+    def test_mesh_scale_is_used_by_the_wireframe(self):
+        expected = self.render()
+        self.aligner.set_mesh(self.V * 100, self.F, scale=0.01)
+        np.testing.assert_array_equal(self.render(), expected)
 
 
 if __name__ == "__main__":

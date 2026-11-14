@@ -527,13 +527,14 @@ class LidarMapMatcher:
         gray, K, T = paired
         return self.edge_aligner.score(gray, K, self.T_slam_to_map @ T)
 
-    def image_overlay(self, pose):
-        """The camera frame with the scan's edges drawn on it, or None."""
+    def image_overlay(self, pose, opacity=0.8):
+        """The paired camera frame with the scan wireframe, or None."""
         paired = self._paired_frame(pose)
         if paired is None:
             return None
         gray, K, T = paired
-        return self.edge_aligner.overlay(gray, K, self.T_slam_to_map @ T)
+        return self.edge_aligner.overlay(gray, K, self.T_slam_to_map @ T,
+                                         opacity=opacity)
 
     def set_map_scale(self, metres_per_unit):
         """Set the map file's units, in metres per file unit.

@@ -56,7 +56,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QPushButton, QProgressDialog,
     QVBoxLayout, QHBoxLayout, QWidget, QFrame, QSizePolicy, QScrollArea,
     QSplitter, QTabWidget, QLineEdit, QAction, QFileDialog, QMessageBox,
-    QComboBox, QSpinBox, QDoubleSpinBox, QFormLayout, QCheckBox
+    QComboBox, QSpinBox, QDoubleSpinBox, QFormLayout, QCheckBox, QSlider
 )
 from PyQt5.QtGui import (QImage, QPixmap, QFont, QPainter, QPen, QColor,
                          QBrush, QKeySequence)
@@ -1217,9 +1217,6 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
                                  "Assigned Locators: set each marker's centre and orientation; +X points to its printed top and +Z out of its face. "
                                  "Auto lineup turns a Locator more than 10° off what the camera sees; positions are never moved. "
                                  "Measure the black square, excluding the white paper margin."))
-        self.btn_ar = QCheckBox("Show scan overlay")
-        self.btn_ar.toggled.connect(self._toggle_ar_overlay)
-        settings.addWidget(self.btn_ar)
         self.btn_depth_view = QCheckBox("Show depth preview beside camera")
         self.btn_depth_view.setToolTip(
             "Dots mark camera pixels with usable depth (red near, blue far); no dots, no depth. "
@@ -1271,6 +1268,7 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         preview_layout.addWidget(self.lbl_preview_title)
         self.lbl_track = self._cambox(240, 135, "Waiting for D455 infrared image")
         preview_layout.addWidget(self.lbl_track, 1)
+        preview_layout.addWidget(self._build_ar_overlay_panel())
         self.lbl_tracking_hint = QLabel("Keep clear surface detail in view for motion tracking.")
         self.lbl_tracking_hint.setWordWrap(True)
         self.lbl_tracking_hint.setMinimumHeight(48)
@@ -1356,6 +1354,7 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
     _ar_overlay_on = False
     _ar_overlay = None
     _ar_frame_n = 0
+    _ar_opacity = 0.8
     _depth_view_on = True
     depth_preview_panel = None
     _depth_preview_join = None
@@ -2985,10 +2984,52 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         self.lineup_panel.hide()
         return self.lineup_panel
 
+    def _build_ar_overlay_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.btn_ar = QCheckBox("Show scan wireframe overlay")
+        self.btn_ar.setToolTip(
+            "Draw the scan's visible triangle edges over the camera. Backface culling is on.")
+        layout.addWidget(self.btn_ar)
+        transparency_row = QHBoxLayout()
+        self.lbl_ar_transparency = QLabel()
+        transparency_row.addWidget(self.lbl_ar_transparency)
+        self.ar_transparency = QSlider(Qt.Horizontal)
+        self.ar_transparency.setRange(0, 100)
+        self.ar_transparency.setValue(round((1.0 - self._ar_opacity) * 100))
+        self.ar_transparency.setAccessibleName("Scan overlay transparency")
+        self.ar_transparency.setMinimumWidth(80)
+        self.ar_transparency.setFixedHeight(22)
+        self.ar_transparency.setStyleSheet(
+            "QSlider::groove:horizontal {height:6px;background:#344356;border-radius:3px;}"
+            "QSlider::sub-page:horizontal {background:#6ba9d9;border-radius:3px;}"
+            "QSlider::handle:horizontal {width:14px;margin:-4px 0;background:#dce4ef;border-radius:7px;}"
+            "QSlider::sub-page:horizontal:disabled {background:#52677e;}"
+            "QSlider::handle:horizontal:disabled {background:#8295ad;}")
+        self.ar_transparency.setToolTip(
+            "0%: solid wireframe. 100%: camera only. Backface culling stays on.")
+        self.ar_transparency.setEnabled(self._ar_overlay_on)
+        self.ar_transparency.valueChanged.connect(self._set_ar_transparency)
+        self.lbl_ar_transparency.setBuddy(self.ar_transparency)
+        transparency_row.addWidget(self.ar_transparency, 1)
+        layout.addLayout(transparency_row)
+        self._set_ar_transparency(self.ar_transparency.value())
+        self.btn_ar.setChecked(self._ar_overlay_on)
+        self.btn_ar.toggled.connect(self._toggle_ar_overlay)
+        return panel
+
+    def _set_ar_transparency(self, percent):
+        self._ar_opacity = 1.0 - percent / 100.0
+        self.lbl_ar_transparency.setText(f"Transparency: {percent}%")
+        self._ar_frame_n = 9  # apply on the next display tick
+
     def _toggle_ar_overlay(self, on):
         self._ar_overlay_on = bool(on)
         self._ar_overlay = None
-        self.btn_ar.setText("Show scan overlay")
+        self._ar_frame_n = 9
+        self.ar_transparency.setEnabled(on)
         if on and (self.lidar_matcher is None
                    or not self.lidar_matcher.is_aligned):
             print("[Overlay] complete Auto lineup before viewing the scan overlay.")
@@ -3011,7 +3052,8 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         # A None result (no pose within the pairing tolerance) leaves the last
         # overlay on screen rather than blanking it.
         try:
-            self._ar_overlay = matcher.image_overlay(self.engine.pose_at)
+            self._ar_overlay = matcher.image_overlay(
+                self.engine.pose_at, opacity=self._ar_opacity)
         except Exception as exc:
             print(f"[Overlay] error: {exc}")
             self._ar_overlay = None

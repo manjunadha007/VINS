@@ -1205,7 +1205,8 @@ class TestOverlayFramePairing(unittest.TestCase):
         def _record(self, gray, K, T_map_cam):
             self.calls.append((gray, K, np.asarray(T_map_cam, dtype=float).copy()))
 
-        def overlay(self, gray, K, T_map_cam, colour=(0, 255, 255)):
+        def overlay(self, gray, K, T_map_cam, colour=(0, 255, 255), opacity=0.8):
+            self.opacity = opacity
             self._record(gray, K, T_map_cam)
             return gray
 
@@ -1247,6 +1248,14 @@ class TestOverlayFramePairing(unittest.TestCase):
         # mid-move -- must not be what got drawn.
         moved = make_transform((0.4, 0.0, 1.5), (0, 0, 0, 1))
         self.assertFalse(np.allclose(used, m.T_slam_to_map @ moved, atol=1e-3))
+
+    def test_overlay_passes_opacity_without_changing_the_alignment(self):
+        m = self._matcher()
+        m.set_image(self._gray(), self.K, 10.0)
+        alignment = m.T_slam_to_map.copy()
+        m.image_overlay(lambda stamp: self.POSE, opacity=0.35)
+        self.assertEqual(m.edge_aligner.opacity, 0.35)
+        np.testing.assert_array_equal(m.T_slam_to_map, alignment)
 
     def test_unpairable_frame_draws_nothing_rather_than_the_wrong_pose(self):
         m = self._matcher()
@@ -1330,8 +1339,9 @@ class TestDashboardOverlayWiring(unittest.TestCase):
         def __init__(self):
             self.handed = None
 
-        def image_overlay(self, pose):
+        def image_overlay(self, pose, opacity=0.8):
             self.handed = pose
+            self.opacity = opacity
             # Stand in for the stored frame: ask about one known stamp.
             return pose(4242.0)
 
@@ -1355,6 +1365,31 @@ class TestDashboardOverlayWiring(unittest.TestCase):
         self.assertEqual(stub.engine.asked, [4242.0],
                          "the pose must be looked up at the frame's own stamp")
         self.assertIsNotNone(stub._ar_overlay)
+
+    def test_transparency_slider_changes_the_next_overlay_and_keeps_its_pose_pair(self):
+        from PyQt5.QtWidgets import QApplication, QMainWindow
+        app = QApplication.instance() or QApplication([])
+        stub = self._stub()
+        QMainWindow.__init__(stub)
+        panel = stub._build_ar_overlay_panel()
+        try:
+            self.assertEqual(stub.ar_transparency.value(), 20)
+            self.assertTrue(stub.ar_transparency.isEnabled())
+            stub.ar_transparency.setValue(65)
+            stub._refresh_ar_overlay()
+            self.assertAlmostEqual(stub.lidar_matcher.opacity, 0.35)
+            self.assertIn("65%", stub.lbl_ar_transparency.text())
+            self.assertEqual(stub.engine.asked, [4242.0])
+            stub.btn_ar.setChecked(False)
+            self.assertFalse(stub.ar_transparency.isEnabled())
+            self.assertIsNone(stub._ar_overlay)
+            stub.btn_ar.setChecked(True)
+            self.assertTrue(stub.ar_transparency.isEnabled())
+            self.assertEqual(stub.ar_transparency.value(), 65)
+        finally:
+            panel.close()
+            stub.deleteLater()
+            app.processEvents()
 
 
 if __name__ == "__main__":

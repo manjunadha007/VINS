@@ -587,30 +587,63 @@ class EdgeAligner:
         }
 
     # ── AR overlay, the thing an operator actually trusts ────────────────────
-    def overlay(self, gray, K, T_map_cam, colour=(0, 255, 255)):
-        """The camera frame with the scan's edges drawn over it, in colour.
+    def _wireframe_mask(self, K, T_map_optical, width, height):
+        """Visible triangle boundaries at camera resolution, with backfaces culled.
 
-        The numeric score says the lineup is good; this is how an operator
-        confirms it -- the same way a matchmove artist checks a lineup by
-        looking at it rather than at a residual.
+        Triangle IDs retain the mesh's internal edges, including coplanar
+        diagonals that the lineup's silhouette/crease detector cannot see.
+        Ray casting supplies visibility and clipping without projecting edges
+        behind the camera or drawing hidden geometry through the room.
+        """
+        rays = self._scene.create_rays_pinhole(
+            intrinsic_matrix=o3d.core.Tensor(np.ascontiguousarray(K)),
+            extrinsic_matrix=o3d.core.Tensor(
+                np.ascontiguousarray(invert_transform(T_map_optical))),
+            width_px=width, height_px=height)
+        hits = self._scene.cast_rays(rays)
+        depth = hits["t_hit"].numpy()
+        normals = hits["primitive_normals"].numpy()
+        facing = np.sum(normals * rays.numpy()[:, :, 3:6], axis=2) < 0.0
+        visible = (np.isfinite(depth) & (depth > 0.05)
+                   & (depth < self.max_range_m) & facing)
+        ids = hits["primitive_ids"].numpy().copy()
+        ids[~visible] = o3d.t.geometry.RaycastingScene.INVALID_ID
+
+        # Mark both sides of each boundary for a legible two-pixel wire.
+        # Do not outline the image border when a triangle extends offscreen.
+        mask = np.zeros((height, width), dtype=bool)
+        horizontal = ids[:, 1:] != ids[:, :-1]
+        vertical = ids[1:, :] != ids[:-1, :]
+        mask[:, 1:] |= horizontal
+        mask[:, :-1] |= horizontal
+        mask[1:, :] |= vertical
+        mask[:-1, :] |= vertical
+        return (mask & visible).astype(np.uint8) * 255
+
+    def overlay(self, gray, K, T_map_cam, colour=(0, 255, 255), opacity=0.8):
+        """Full-resolution camera frame with a backface-culled mesh wireframe.
+
+        Opacity affects only the wireframe and its dark outline; the camera
+        image stays unchanged elsewhere. Zero opacity returns the camera alone.
+        This display never changes the edge score or the alignment solution.
         """
         if not self.available or gray is None:
             return None
         gray = np.asarray(gray)
-        if gray.ndim == 3:
-            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape[:2]
-        scale = self.work_width / float(w)
-        height = max(1, int(round(h * scale)))
-        Ks = np.asarray(K, dtype=float).copy()
-        Ks[:2, :] *= scale
-        px, _ = self._model_edges(
-            Ks, np.asarray(T_map_cam, dtype=float) @ T_BODY_OPTICAL,
-            self.work_width, height)
-        canvas = cv2.cvtColor(
-            cv2.resize(gray, (self.work_width, height),
-                       interpolation=cv2.INTER_AREA), cv2.COLOR_GRAY2BGR)
-        if px is None:
+        canvas = (cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                  if gray.ndim == 2 else gray.copy())
+        opacity = float(np.clip(opacity, 0.0, 1.0))
+        if opacity == 0.0:
             return canvas
-        canvas[px[:, 1].astype(np.int32), px[:, 0].astype(np.int32)] = colour
-        return canvas
+        h, w = gray.shape[:2]
+        mask = self._wireframe_mask(
+            np.asarray(K, dtype=float),
+            np.asarray(T_map_cam, dtype=float) @ T_BODY_OPTICAL, w, h)
+        if not np.any(mask):
+            return canvas
+        wires = canvas.copy()
+        # A dark one-pixel border keeps the yellow lines readable on bright IR.
+        outline = cv2.dilate(mask, np.ones((3, 3), dtype=np.uint8))
+        wires[outline != 0] = (0, 0, 0)
+        wires[mask != 0] = colour
+        return cv2.addWeighted(canvas, 1.0 - opacity, wires, opacity, 0.0)

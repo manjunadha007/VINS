@@ -203,7 +203,11 @@ position axes; include walls, corners or fixed furniture.
 **Camera** channels are live readouts in this dashboard, so dragging the dot
 cannot take over tracking with a frozen preview. Locator, scan, trail and world
 reference transforms remain editable in their Channel Boxes. Scan overlay is
-available in **Setup** and turns on automatically after an accepted match.
+available directly below the **Live Camera / Scan Overlay** preview and turns
+on automatically after an accepted match.
+The overlay draws a yellow mesh wireframe at camera resolution with backface
+culling on. Adjust **Transparency** below **Show scan wireframe overlay**:
+0% gives solid lines, 100% shows only the camera image (default: 20%).
 **File → Save** records the locator transform and marker settings.
 
 The marker supplies a camera pose at its captured image timestamp, including the
