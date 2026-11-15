@@ -1,0 +1,91 @@
+# HyperFusion testing arena -- the scenarios a take can be recorded for.
+#
+#   ./arena.sh list            what is defined, recorded, referenced and scored
+#   ./arena.sh record s2       guided recording of one take
+#   ./arena.sh test s2         replay the latest s2 take and score it
+#
+# Each scenario's `steps` are the moments the operator confirms during the take
+# by pressing Enter. They become timestamped marks in the take: scoring starts
+# at step 1, and the score is also broken down between consecutive steps.
+# Typing text before Enter drops a free note instead (s4: "p" whenever a person
+# blocks the view).
+#
+# `pass` -- how a take is judged against its 3DEqualizer camera
+# (arena/reference/<take>.abc): a frame passes when the dashboard's camera is
+# within frame_mm and frame_deg of the 3DE camera, and the take passes when at
+# least min_frames of its frames do. A scenario can override any of the three.
+
+defaults:
+  setup:
+    - "Mark the start spot on the ground (tape) and note the camera height, so the return is to the same place."
+    - "Dashboard running via ./launch_isaac.sh, scan imported, Locators set, Auto lineup ON and green (Locked)."
+    - "Outdoors on the terrace: launch with VP_EMITTER_MODE=off (projector is useless in daylight)."
+    - "GNSS receiver connected (Setup > GNSS), antenna with open sky; the recorder shows its fix before you start."
+    - "Hold still on the start markers for 20 s before step 1: a replay locks from them (~7 s)
+       and its fusion then settles (~10 s; replays differ by up to 28 mm / 0.8 deg until it has)."
+  pass:
+    frame_mm: 20
+    frame_deg: 0.5
+    min_frames: 0.90
+
+scenarios:
+  - id: s1_lidar_throughout
+    title: "3 markers, away and back, LiDAR usable throughout"
+    description: >
+      Start with 3 markers in frame. Move the camera away from the markers and
+      bring it back to the same position. Scan geometry the LiDAR fusion can
+      use stays in view for the whole take.
+    exercises:
+      - Multi-marker lock at the start
+      - Scan-verified tracking with no markers in view
+      - Return accuracy against the start pose
+    steps:
+      - "Locked at the start: 3 markers in view, held still for 20 s"
+      - "Leaving the markers"
+      - "Back at the start spot, holding still"
+
+  - id: s2_lidar_gap
+    title: "3 markers, away and back, no LiDAR in the middle"
+    description: >
+      Start with 3 markers in frame and slowly move the camera away from the
+      markers, through an area with nothing the LiDAR lineup can use, then
+      back to the same position. The first and last frames have the 3 markers
+      in view; the middle of the take has no usable scan geometry.
+    exercises:
+      - Stereo/IMU-only tracking (amber "Camera tracking") with no scan support
+      - No false scan lock on unusable geometry
+      - Re-acquiring the lock from the markers on return; drift accumulated in the gap
+    steps:
+      - "Locked at the start: 3 markers in view, held still for 20 s"
+      - "Leaving the markers (slowly)"
+      - "Back at the start spot, holding still"
+
+  - id: s3_single_marker_start
+    title: "1 marker start, route with more markers, LiDAR and open sky"
+    description: >
+      Start with only 1 marker in frame. Move the camera away from it and bring
+      it back to the same position. The route includes the additional markers,
+      areas the LiDAR lineup can use, and open sky.
+    exercises:
+      - Single-marker lock at the start
+      - Additional markers placing themselves into the layout as they come into view
+      - Open sky (no depth returns) not causing a false or degraded lock
+    steps:
+      - "Locked at the start: 1 marker in view, held still for 20 s"
+      - "Leaving the marker"
+      - "Back at the start spot, holding still"
+
+  - id: s4_sky_and_people
+    title: "3 markers, open sky and people passing close"
+    description: >
+      Start with the 3 markers in frame and move the camera around, with open
+      sky in view and people passing close to the camera, potentially blocking
+      its view. Type p + Enter each time someone blocks the view.
+    exercises:
+      - Tracking through close occlusions by people (moving, non-static scene content)
+      - Open sky in view
+      - Output holds or recovers instead of jumping when the view is blocked
+    steps:
+      - "Locked at the start: 3 markers in view, held still for 20 s"
+      - "Moving around: sky in view, people passing close"
+      - "Back at the start spot with the markers in view, holding still"

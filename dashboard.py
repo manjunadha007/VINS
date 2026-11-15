@@ -46,8 +46,10 @@ import collections
 # dashboard down with ModuleNotFoundError even when GNSS was disabled.
 
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Image, Imu, CameraInfo
+from sensor_msgs.msg import Image, Imu, CameraInfo, NavSatFix
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from std_msgs.msg import String
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from cv_bridge import CvBridge
 import cv2
 import cv2.aruco as aruco
@@ -67,6 +69,7 @@ from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QRect
 # launch_isaac.sh copies them into the container workspace.
 # ──────────────────────────────────────────────────────
 from freed import get_freed_packet
+import arena_state
 from tracking_engine import TrackingEngine
 from gnss_receiver import GNSSReceiver
 from pose_transform import (PoseGate, PosePredictor, PoseSmoother, PoseTransformer,
@@ -494,6 +497,26 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         "padding:5px 14px; font-size:11px;"
     )
     _marker_request = None
+    # Testing-arena records (arena_state.py). Plain attributes, so the FreeD
+    # path can read them from the ROS thread when send_rate_hz is 0.
+    _lineup_indicator = None
+    _arena_state_pub = None
+    _arena_scene_pub = None
+    _arena_last_publish = 0.0
+    _arena_scene_json = None
+    _arena_failed = False
+    _arena_scene_failed = False
+    _arena_ticks = 0
+    _arena_gnss_nmea_pub = None
+    _arena_gnss_fix_pub = None
+    _arena_gnss_failed = False
+    _arena_replay_scene = None
+    _arena_arm_pending = False
+    _arena_fresh_since = None
+    _arena_armed = False
+    _arena_retry_since = None
+    _arena_rearms = 0
+    ARENA_MAX_REARMS = 5
     _marker_detection_sample = None
     _find_thread = None
     _find_observation = None
@@ -706,11 +729,39 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
                                "/camera/depth/camera_info"),
                     self.gui.depth_camera_info_callback, 1)
 
+                # Testing arena: what this dashboard actually sent, and the
+                # scene it ran with (see arena_state.py). The scene is
+                # transient-local so a recorder started later still gets it.
+                self.gui._arena_state_pub = self.create_publisher(
+                    String, arena_state.STATE_TOPIC, 50)
+                self.gui._arena_scene_pub = self.create_publisher(
+                    String, arena_state.SCENE_TOPIC,
+                    QoSProfile(depth=1,
+                               durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                               reliability=ReliabilityPolicy.RELIABLE))
+                # GNSS is read here, from serial, so it is only in a take if
+                # the dashboard republishes it: raw NMEA for replay, NavSatFix
+                # for viewers.
+                self.gui._arena_gnss_nmea_pub = self.create_publisher(
+                    String, arena_state.GNSS_NMEA_TOPIC, 50)
+                self.gui._arena_gnss_fix_pub = self.create_publisher(
+                    NavSatFix, arena_state.GNSS_FIX_TOPIC, 10)
+
         self.ros_node = DashboardNode(self)
         self._projector = ProjectorControl(RosProjectorParameters(self.ros_node))
         self._projector_timer = QTimer(self)
         self._projector_timer.timeout.connect(self._refresh_projector)
         self._projector_timer.start(100)
+        self._arena_ticks = 0
+        self._arena_timer = QTimer(self)
+        self._arena_timer.timeout.connect(self._arena_tick)
+        self._arena_timer.start(200)
+        # Testing-arena replay (arena_replay.py): open the take's scene and arm
+        # Auto lineup as the operator had it. Never set in a live launch.
+        self._arena_replay_scene = os.environ.get("VP_ARENA_SCENE") or None
+        if self._arena_replay_scene:
+            QTimer.singleShot(1000, lambda: self._open_scene_path(
+                self._arena_replay_scene, interactive=False))
         self.ros_thread = threading.Thread(
             target=rclpy.spin, args=(self.ros_node,), daemon=True)
         self.ros_thread.start()
@@ -805,8 +856,41 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
 
     def _start_gnss(self):
         self.cfg["gnss"]["port"] = self.gnss_port.text().strip()
-        self.gnss_thread = GNSSReceiver(self.cfg["gnss"], self.engine.update_gnss)
+        self.gnss_thread = GNSSReceiver(self.cfg["gnss"], self._on_gnss_fix,
+                                        on_line=self._arena_gnss_line)
         self.gnss_thread.start()
+
+    def _on_gnss_fix(self, fix):
+        """GNSS thread: the engine first, then the arena's NavSatFix record.
+
+        A publishing failure is reported once and never reaches the receiver
+        thread, which an escaping exception would end.
+        """
+        result = self.engine.update_gnss(fix)
+        pub = self._arena_gnss_fix_pub
+        if pub is not None and not self._arena_gnss_failed:
+            try:
+                msg = NavSatFix()
+                # fix.received is monotonic; the bag runs on host wall time.
+                stamp = time.time() - (time.monotonic() - fix.received)
+                msg.header.stamp.sec = int(stamp)
+                msg.header.stamp.nanosec = int((stamp % 1.0) * 1e9)
+                msg.header.frame_id = "gnss_antenna"
+                fields = arena_state.navsat_fields(fix)
+                msg.status.status = fields.pop("status")
+                for name, value in fields.items():
+                    setattr(msg, name, value)
+                pub.publish(msg)
+            except Exception as exc:
+                self._arena_gnss_failed = True
+                print(f"[Arena] GNSS fix publishing stopped: {exc!r}")
+        return result
+
+    def _arena_gnss_line(self, line):
+        """GNSS thread: one raw receiver line, as read, for replay."""
+        pub = self._arena_gnss_nmea_pub
+        if pub is not None:
+            pub.publish(String(data=arena_state.encode_nmea(line, time.time())))
 
     _MENUBAR_QSS = (
         "QMenuBar{background:#151d28;color:#c3d2e3;border-bottom:1px solid #273447;"
@@ -972,8 +1056,8 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         recomputed: which scan is loaded, where the alignment put it, and
         where the tracking origin sits. Poses stream in again on their own.
         """
-        viewer = getattr(self, "map_viewer", None)
-        if viewer is None:
+        scene = self._scene_dict()
+        if scene is None:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Scene", "scene.json", "HyperFusion scene (*.json);;All (*)")
@@ -981,10 +1065,30 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
             return
         if not os.path.splitext(path)[1]:
             path += ".json"
-        scene = {
+        try:
+            with open(path, "w") as fh:
+                json.dump(scene, fh, indent=2)
+        except OSError as e:
+            # A save that silently failed is worse than no save button at all.
+            QMessageBox.warning(self, "Save Failed", f"Could not write:\n{path}\n\n{e}")
+            print(f"[Dashboard] ❌ Scene save failed: {e}")
+            return
+        print(f"[Dashboard] ✅ Scene saved: {path}")
+
+    def _scene_dict(self, saved=True):
+        """The scene as File > Save writes it, or None before the viewer exists.
+
+        Also what the testing arena records with every take; it passes
+        saved=False so the dict only changes when the scene does.
+        """
+        viewer = getattr(self, "map_viewer", None)
+        if viewer is None:
+            return None
+        return {
             "format": "hyperfusion.scene",
             "version": 1,
-            "saved": datetime.datetime.now().isoformat(timespec="seconds"),
+            "saved": (datetime.datetime.now().isoformat(timespec="seconds")
+                      if saved else None),
             "map_file": getattr(self, "_map_path", None),
             "alignment": {
                 "tx": viewer.tx, "ty": viewer.ty, "tz": viewer.tz,
@@ -1009,15 +1113,6 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
                 for name in ("trail", "world")
             },
         }
-        try:
-            with open(path, "w") as fh:
-                json.dump(scene, fh, indent=2)
-        except OSError as e:
-            # A save that silently failed is worse than no save button at all.
-            QMessageBox.warning(self, "Save Failed", f"Could not write:\n{path}\n\n{e}")
-            print(f"[Dashboard] ❌ Scene save failed: {e}")
-            return
-        print(f"[Dashboard] ✅ Scene saved: {path}")
 
     def _menu_open_scene(self):
         """File > Open — restore a scene written by Save Scene.
@@ -1028,27 +1123,34 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         imported again even when it is already loaded: the import is what
         drops a lineup solved against the old placement.
         """
-        viewer = getattr(self, "map_viewer", None)
-        if viewer is None:
+        if getattr(self, "map_viewer", None) is None:
             return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Scene", "", "HyperFusion scene (*.json);;All (*)")
-        if not path:
-            return
+        if path:
+            self._open_scene_path(path)
+
+    def _open_scene_path(self, path, interactive=True):
+        """Open a scene file: File > Open, and the testing arena's replay."""
+        viewer = getattr(self, "map_viewer", None)
+        if viewer is None:
+            return False
         try:
             scene = self._read_scene(path)
         except (OSError, ValueError, TypeError, KeyError) as e:
-            QMessageBox.warning(self, "Open Failed", f"Could not open:\n{path}\n\n{e}")
+            if interactive:
+                QMessageBox.warning(self, "Open Failed", f"Could not open:\n{path}\n\n{e}")
             print(f"[Dashboard] ❌ Scene open failed: {e}")
-            return
+            return False
         self._cancel_marker_lineup("Opening scene…", failed=False)
         if scene["map_file"]:
             self._pending_scene = scene
             self._on_map_loaded(scene["map_file"])
-            return
+            return True
         if viewer.has_map():
             self._delete_scan()
         self._restore_scene(scene)
+        return True
 
     def _read_scene(self, path):
         """Parse and check a scene file before anything in the session changes.
@@ -1149,6 +1251,8 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         self._marker_status("Scene opened. Check the Locators against the scan, then enable Auto lineup.",
                             armed=False)
         print(f"[Dashboard] ✅ Scene opened: {scene['path']}")
+        if self._arena_replay_scene == scene["path"]:
+            self._arena_arm_pending = True       # armed by _arena_tick once poses flow
 
     def _build_ui(self):
         self._automatic_lineup_only = True
@@ -2511,6 +2615,7 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
                           else status["reason"])
         button.setText(title)
         button.setProperty("lineupState", state)
+        self._lineup_indicator = (button.isChecked(), state, title)
         self.lbl_marker_lineup.setText(detail)
         fill = colour if button.isChecked() else "#151e29"
         self._set_status_style(button,
@@ -3853,6 +3958,7 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         except Exception as exc:
             if self.engine.packets_sent <= 1:
                 print(f"[FreeD] send failed to {UDP_IP}:{UDP_PORT} — {exc}")
+        self._arena_publish(pkt)
 
         # TrajectoryCanvas was superseded by MapViewerWidget, but the test
         # harness still builds one; feed it when it is there. The live viewport
@@ -3862,6 +3968,99 @@ class HyperFusionApp(MaximizeAsNormalWindow, QMainWindow):
         pose = self.engine.latest_unreal
         if canvas is not None and pose is not None:
             canvas.update_trajectory(pose.x, pose.y, pose.z, pose.pan)
+
+    def _arena_publish(self, packet=None):
+        """Publish one testing-arena state record (see arena_state.py).
+
+        Runs after every FreeD packet -- on the ROS thread when send_rate_hz is
+        0 -- so it reads plain attributes only, never widgets. It must never
+        break the FreeD path: the first failure is reported and publishing
+        stops for the session.
+        """
+        pub = self._arena_state_pub
+        if pub is None or self._arena_failed:
+            return
+        try:
+            engine = self.engine
+            status = engine.fusion_status()
+            now = time.time()
+            record = arena_state.build_state(
+                now, self._output_mode(status), self._lineup_indicator, status,
+                packet=packet, packets_sent=engine.packets_sent,
+                output_T=engine._output_T,
+                gnss=arena_state.gnss_summary(getattr(engine, "gnss_fix", None),
+                                              time.monotonic()))
+            pub.publish(String(data=arena_state.encode(record)))
+            self._arena_last_publish = now
+        except Exception as exc:
+            self._arena_failed = True
+            print(f"[Arena] state publishing stopped: {exc!r}")
+
+    def _arena_arm_lineup(self):
+        """Replay only: switch Auto lineup on as the operator had it.
+
+        Without the scan-scale measurement that switching it on normally
+        starts with three or more markers: live, that ran before recording,
+        and the take's scene already carries its result. Re-measuring here
+        could re-fit the scale and move the dashboard's world away from the
+        one 3DE solved in.
+        """
+        button = self.btn_marker_lineup
+        button.blockSignals(True)
+        button.setChecked(True)
+        button.blockSignals(False)
+        self._toggle_marker_lineup(True, calibrate_scale=False)
+        print("[Arena] Replay: Auto lineup armed")
+
+    def _arena_tick(self):
+        """5 Hz: heartbeat while no FreeD goes out; republish a changed scene."""
+        if self._arena_state_pub is None:
+            return
+        if time.time() - self._arena_last_publish > 0.25:
+            self._arena_publish(None)
+        if self._arena_arm_pending:
+            # Arm only once poses have flowed for 2 s, as an operator would:
+            # arming before SLAM starts would be cancelled by its first resync.
+            engine = self.engine
+            fresh = engine.predictor.has_pose and engine.predictor.age(time.time()) < 0.5
+            if not fresh:
+                self._arena_fresh_since = None
+            elif self._arena_fresh_since is None:
+                self._arena_fresh_since = time.monotonic()
+            elif time.monotonic() - self._arena_fresh_since >= 2.0:
+                self._arena_arm_pending = False
+                self._arena_armed = True
+                self._arena_arm_lineup()
+        elif self._arena_armed and not self.btn_marker_lineup.isChecked() and self._marker_failed:
+            # Auto lineup said Retry -- e.g. it turned a Locator upright, which
+            # changes the layout and by design cancels the armed lineup. Live,
+            # the operator presses it again; a replay does the same, a bounded
+            # number of times, and says why each time.
+            if self._arena_retry_since is None:
+                self._arena_retry_since = time.monotonic()
+                print(f"[Arena] Replay: Auto lineup -> Retry: {self.lbl_marker_lineup.text()}")
+            elif (time.monotonic() - self._arena_retry_since >= 1.0
+                    and self._arena_rearms < self.ARENA_MAX_REARMS):
+                self._arena_rearms += 1
+                self._arena_retry_since = None
+                print(f"[Arena] Replay: arming again ({self._arena_rearms}/{self.ARENA_MAX_REARMS})")
+                self._arena_arm_lineup()
+        else:
+            self._arena_retry_since = None
+        self._arena_ticks += 1
+        if self._arena_ticks % 5 != 1 or self._arena_scene_failed:
+            return
+        try:
+            scene = self._scene_dict(saved=False)
+            if scene is None:
+                return
+            text = json.dumps(scene, sort_keys=True)
+            if text != self._arena_scene_json:
+                self._arena_scene_pub.publish(String(data=text))
+                self._arena_scene_json = text
+        except Exception as exc:
+            self._arena_scene_failed = True
+            print(f"[Arena] scene publishing stopped: {exc!r}")
 
     @staticmethod
     def _set_status_style(widget, stylesheet):
@@ -4112,6 +4311,11 @@ def main():
     app = QApplication(sys.argv)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     win = HyperFusionApp()
+    if win._arena_replay_scene:
+        # Testing-arena replay: arena_replay.py stops this instance with
+        # SIGTERM. rclpy's own handler would only shut ROS down and leave Qt
+        # running on a dead context until it is killed; quit instead.
+        signal.signal(signal.SIGTERM, lambda *_: app.quit())
     win.show()
     sys.exit(app.exec_())
 

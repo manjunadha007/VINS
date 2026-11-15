@@ -16,3 +16,6 @@ core
 # .obj/.ply/.pcd captures here rather than committing them.
 *.ply
 *.pcd
+
+# Testing arena data (symlink to ~/workspaces/isaac_ros-dev/arena)
+arena

@@ -75,6 +75,12 @@ runs its own tests in place.
 | [test_new_pipeline.sh](test_new_pipeline.sh) | Cold-start the container |
 | [bench_fusion.py](bench_fusion.py) | Map-fusion accuracy/timing benchmark against a scan |
 | [smoke_locator_lock.py](smoke_locator_lock.py) | End-to-end check of the locator lock-on path |
+| [arena.sh](arena.sh) / [arena.py](arena.py) | Testing arena: record, replay and score scenario takes |
+| [arena_scenarios.yaml](arena_scenarios.yaml) | The arena's scenarios, their steps and pass criteria |
+| [arena_state.py](arena_state.py) | The dashboard's per-packet output record the arena captures |
+| [arena_export.py](arena_export.py) | Take -> 3DE plate, frame times, survey points, scaled scan |
+| [arena_replay.py](arena_replay.py) | Replays a take through cuVSLAM + the dashboard (ROS domain 87) |
+| [arena_score.py](arena_score.py) / [arena_abc.py](arena_abc.py) | Scores a run against the 3DE camera (.abc read by Blender) |
 
 Legacy, kept for reference: [start_pipeline.sh](start_pipeline.sh) +
 [ros_vins_to_unreal.py](ros_vins_to_unreal.py) + [zupt_imu_node.py](zupt_imu_node.py)
@@ -545,6 +551,70 @@ not.
 | Status shows `TRACKING LOST — HOLDING` | SLAM stopped publishing. The last good pose is held rather than teleporting the camera. Re-initialise with slow motion across textured geometry. |
 | Ground zero anchors in the wrong place | `aruco.marker_size_m` does not match the printed marker, or `camera_info` never arrived so fallback intrinsics were used (the console reports which). |
 | SLAM node exits at startup, or the profile list is missing modes (848x480, 60/90 fps) | Almost always a USB 2 negotiation, not a device or bandwidth limit: librealsense truncates the profile list severely on USB 2, and the IR pair alone needs ~586 Mbps at 848x480x90 (depth adds the same again). Check `rs-enumerate-devices \| grep -i 'usb type'` — it must report 3.2. Re-seat into a USB 3 port, and over a long run use an active optical cable rated 5 Gbps Gen 1 and powered at the camera end; a USB 2 fallback cable reproduces exactly this symptom. See the notes at the top of `isaac_vp.launch.py`. |
+
+## Testing arena
+
+Measures the tracking against a hand-made reference: real takes of four
+scenarios, matchmoved in 3DEqualizer, replayed through cuVSLAM and the
+dashboard as often as needed. A take passes when at least 90% of its frames are
+within 20 mm and 0.5° of the 3DE camera (`pass` in
+[arena_scenarios.yaml](arena_scenarios.yaml)).
+
+| | Scenario |
+|---|---|
+| s1 | 3 markers, away and back, LiDAR usable throughout |
+| s2 | 3 markers, away and back, no LiDAR in the middle |
+| s3 | 1 marker start; route with more markers, LiDAR and open sky |
+| s4 | 3 markers, open sky and people passing close |
+
+**1. Record** (pipeline up via `./launch_isaac.sh`, Auto lineup Locked):
+
+```bash
+./arena.sh record s1
+```
+
+Enter confirms each step -- hold still on the start markers for **20 s**
+before step 1 --, text + Enter drops a note (s4: `p` when a person blocks the
+view), q + Enter or Ctrl-C stops. Recording only subscribes. The take is
+named `<scenario>_<time>`, e.g. `s1_lidar_throughout_20261115-153000`, and lands
+in `arena/inputs/<take>/` (`arena` is a link to `~/workspaces/isaac_ros-dev/arena`,
+kept out of git): an MCAP bag of stereo, depth, IMU, GNSS, SLAM and what the
+dashboard sent Unreal, plus the scene, config and `take.json`. About 8.8 GB a
+minute.
+
+**2. Track in 3DE.** Recording also writes, in the same folder:
+`plate/<take>.#####.png` (left IR camera at 30 fps -- the camera the dashboard
+tracks, already rectified), `frames.csv` (each frame's exact timestamp),
+`survey_points.txt` (marker corners, metres, Y-up), `scan_3de.obj` (the scan
+exactly as the dashboard uses it -- scaled by Setup > Scan scale, which the
+.obj itself does not carry) and `README_3DE.txt` with the camera settings.
+Solve against the survey points so the camera lands in the dashboard's world,
+then export Alembic in metres at 30 fps, frames from 1, to
+`arena/reference/<take>.abc`. The frame rate must match: read at the wrong rate
+a camera is silently shifted in time.
+
+**3. Test** -- replay the take through the current code and score it:
+
+```bash
+./arena.sh test s1          # latest s1 take; --show to watch the dashboard
+./arena.sh list             # every take: plate, reference, latest PASS/FAIL
+./arena.sh score s1 --live  # what the dashboard did on the day
+```
+
+A replay runs cuVSLAM and the repo's current dashboard in ROS domain 87 beside
+the live pipeline, with FreeD sent nowhere and GNSS, GoPro and video off, and
+shifts every timestamp to "now" so the dashboard's staleness checks behave as
+live. It opens the take's scene and arms Auto lineup by itself (again after a
+Retry, as an operator would). Results go to `arena/runs/<take>/<run>/`:
+`score.json`, `errors.csv` (per frame), logs. The score also says whether a
+failure is a constant offset (lineup or scan scale), a lag, or drift, and flags
+an .abc that is in centimetres or turned.
+
+Measured on this rig (2026-11-15): a replay locks with the same numbers as the
+live dashboard did (96% of the view, 37 mm); two replays of one take agree to
+~2 mm / 0.1° once settled, but differ by up to 28 mm / 0.8° in the ~10 s after
+the lock -- hence the 20 s hold. The camera already drops ~4% of stereo frames;
+the plate uses the nearest frame there and `frames.csv` keeps its real time.
 
 ## Tests
 

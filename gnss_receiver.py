@@ -135,11 +135,26 @@ class NMEAParser:
 
 
 class GNSSReceiver(threading.Thread):
-    def __init__(self, cfg, on_fix, log=print):
+    def __init__(self, cfg, on_fix, log=print, on_line=None):
+        """on_line, if given, receives every raw line read from the receiver
+        (bytes), before parsing -- the testing arena records these so a take
+        can be replayed through this same parser."""
         super().__init__(name="gnss-receiver", daemon=True)
         self.cfg, self.on_fix, self.log = cfg, on_fix, log
+        self.on_line = on_line
         self.stop_event = threading.Event()
         self.status = "Connecting"
+
+    def _emit_line(self, line):
+        # A failing recorder hook must never take GNSS itself down: an
+        # exception escaping into run() would end the thread.
+        if self.on_line is None:
+            return
+        try:
+            self.on_line(line)
+        except Exception as exc:
+            self.on_line = None
+            self.log(f"[GNSS] raw NMEA recording stopped: {exc!r}")
 
     def stop(self):
         self.stop_event.set()
@@ -152,7 +167,10 @@ class GNSSReceiver(threading.Thread):
                 self.status = "Connected; waiting for NMEA GGA / GST"
                 parser = NMEAParser()
                 while not self.stop_event.is_set():
-                    fix = parser.feed(port.readline(1024))
+                    line = port.readline(1024)
+                    if line:
+                        self._emit_line(line)
+                    fix = parser.feed(line)
                     if fix is not None:
                         self.status = "Receiving NMEA"
                         self.on_fix(fix)

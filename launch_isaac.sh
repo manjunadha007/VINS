@@ -227,7 +227,7 @@ ensure_py_module() {
 # silently diverged; it is now generated on every launch. All of these modules
 # must land in the same directory — the dashboard imports them by name.
 echo "1/3 Deploying bridge to $WS/src ..."
-for f in projector_control.py gopro_stream.py realsense_streams.py depth_view.py scan_scale.py scan_localizer.py marker_map.py marker_lineup.py lineup_solver.py lineup_dialog.py fusion_supervisor.py gnss_receiver.py tracking_preflight.py check_pipeline.py dashboard.py freed.py pose_transform.py tracking_config.py verify_tracking.py map_viewer.py bridge_headless.py depth_probe.py lidar_map_matcher.py image_alignment.py tracking_engine.py anchor_cli.py bench_fusion.py smoke_locator_lock.py smoke_lineup.py smoke_gizmo.py test_lidar_fusion.py test_image_alignment.py verify_region.py; do
+for f in arena_state.py arena.py arena_scenarios.yaml projector_control.py gopro_stream.py realsense_streams.py depth_view.py scan_scale.py scan_localizer.py marker_map.py marker_lineup.py lineup_solver.py lineup_dialog.py fusion_supervisor.py gnss_receiver.py tracking_preflight.py check_pipeline.py dashboard.py freed.py pose_transform.py tracking_config.py verify_tracking.py map_viewer.py bridge_headless.py depth_probe.py lidar_map_matcher.py image_alignment.py tracking_engine.py anchor_cli.py bench_fusion.py smoke_locator_lock.py smoke_lineup.py smoke_gizmo.py test_lidar_fusion.py test_image_alignment.py verify_region.py; do
     cp "$DIR/$f" "$WS/src/$f" || exit 1
 done
 # Install the bundled scan beside the relative-path configuration.

@@ -190,6 +190,12 @@ def generate_launch_description():
         output='screen',
     )
 
+    if os.environ.get('VP_REPLAY', '0') not in ('0', ''):
+        # Testing-arena replay (arena_replay.py): the recorded camera topics are
+        # played back, so only cuVSLAM runs -- same parameters, no camera node
+        # and no emitter splitter.
+        return launch.LaunchDescription([visual_slam_launch_container])
+
     processes = [visual_slam_launch_container, realsense_camera_node]
     if _ALTERNATING:
         processes.append(ExecuteProcess(
