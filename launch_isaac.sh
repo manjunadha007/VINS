@@ -111,7 +111,115 @@ cleanup() {
          pkill -f '[r]ealsense_streams.py' || true"
     echo "✅ Pipeline shut down."
 }
-trap cleanup EXIT INT TERM
+# Cleanup hangs off EXIT only; INT/TERM just exit, which fires it once. It used
+# to be trapped on INT directly, and a trap that does not exit makes bash
+# *resume the script* afterwards: Ctrl-C ran cleanup, then carried on with the
+# launch (and Ctrl-C during the install wait below would never have stopped it).
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ── Visible installs ──────────────────────────────────────────────────────────
+# The container is started with --rm, so every cold start re-downloads what the
+# launcher installs into it -- open3d alone is a several-hundred-MB wheel. Those
+# installs used to run under -q or >/dev/null 2>&1, so on a slow connection the
+# launcher sat on "ensuring open3d is installed in container..." for most of an
+# hour and looked hung (2026-11-15: ~85 KB/s, two copies downloading at once).
+#
+# With a terminal on both ends they now run under `docker exec -it`: pip and apt
+# draw their own progress bars, and Ctrl-C reaches the process in the container.
+# Without -i it never did -- the launcher died, the download kept going inside
+# the container, and the next launch started a second copy beside it.
+if [ -t 0 ] && [ -t 1 ]; then
+    EXEC_TTY=(-it)
+else
+    EXEC_TTY=()
+fi
+
+# Run "$@" in the container as user $1, output visible. Under -it, Ctrl-C goes
+# to the container rather than to this script; the INT trap turns that into
+# exit status 130 so the caller can stop the launch. (pip catches SIGINT and
+# exits 1, which on its own is indistinguishable from a failed install.)
+container_run() {
+    local user=$1; shift
+    docker exec "${EXEC_TTY[@]}" -u "$user" "$CONTAINER" \
+        /bin/bash -c 'trap "exit 130" INT; "$@"' container_run "$@"
+}
+
+stop_if_interrupted() {
+    if [ "$1" -eq 130 ]; then
+        echo ""
+        echo "Interrupted."
+        exit 130
+    fi
+}
+
+py_importable() {
+    docker exec -u admin "$CONTAINER" python3 -c "import $1" 2>/dev/null
+}
+
+# PIDs of pip installs of package $1 already running in the container.
+running_pips() {
+    docker exec -u root "$CONTAINER" pgrep -f "pip3? install.*$1" 2>/dev/null | tr '\n' ' '
+}
+
+# Bytes the given pip processes have downloaded so far (their partial wheels).
+pip_download_bytes() {
+    docker exec -u root "$CONTAINER" /bin/bash -c '
+        for p in "$@"; do
+            for fd in /proc/$p/fd/*; do
+                f=$(readlink "$fd" 2>/dev/null) || continue
+                case $f in */pip-unpack-*) stat -c %s "$f" 2>/dev/null ;; esac
+            done
+        done | awk "{s += \$1} END {print s + 0}"' pip_download_bytes "$@"
+}
+
+# A pip install of $1 may already be running in the container, left by an
+# earlier launch that stopped on the host side only. Wait for it, showing how
+# far it has got, rather than start a second download that would split the
+# bandwidth with it.
+wait_for_running_pip() {
+    local package=$1 pids last=0 now msg
+    pids=$(running_pips "$package")
+    [ -n "${pids// /}" ] || return 0
+    echo "    a pip install of $package is already running in the container (PID ${pids% }),"
+    echo "    probably left by an earlier launch -- waiting for it rather than downloading a second copy."
+    echo "    To abandon it instead:  docker exec -u root $CONTAINER kill ${pids% }"
+    while [ -n "${pids// /}" ]; do
+        # shellcheck disable=SC2086  # one argument per PID
+        now=$(pip_download_bytes $pids)
+        if [ "${now:-0}" -eq 0 ]; then
+            msg="resolving or installing..."
+        elif [ "$last" -gt 0 ] && [ "$now" -ge "$last" ]; then
+            msg="$((now / 1048576)) MB downloaded, $(( (now - last) / 10240 )) KB/s"
+        else
+            msg="$((now / 1048576)) MB downloaded"
+        fi
+        if [ -t 1 ]; then printf '\r      %-60s' "$msg"; else echo "      $msg"; fi
+        last=${now:-0}
+        sleep 10
+        pids=$(running_pips "$package")
+    done
+    [ -t 1 ] && echo ""
+    echo "    that pip install has finished"
+}
+
+# Make sure Python module $1 (pip package $2) imports in the container,
+# installing it visibly if not; the remaining arguments go to pip install.
+# Fails if the module still does not import afterwards.
+ensure_py_module() {
+    local module=$1 package=$2; shift 2
+    if py_importable "$module"; then
+        echo "    $package: installed"
+        return 0
+    fi
+    wait_for_running_pip "$package"
+    if ! py_importable "$module"; then
+        echo "    $package: not installed -- installing it in the container..."
+        container_run admin python3 -m pip install "$@" || stop_if_interrupted $?
+    fi
+    py_importable "$module"
+}
 
 # ── 1/3 Deploy ────────────────────────────────────────────────────────────────
 # $WS is bind-mounted into the container at /workspaces/isaac_ros-dev. The copy
@@ -163,8 +271,7 @@ lidar_fusion_enabled() {
 if lidar_fusion_enabled "$WS/src/tracking.yaml"; then
     echo "    LiDAR map fusion enabled in config -> VP_ENABLE_DEPTH=1"
     export VP_ENABLE_DEPTH=1
-    echo "    ensuring open3d is installed in container..."
-    docker exec -u admin "$CONTAINER" /bin/bash -c "python3 -c 'import open3d' 2>/dev/null || python3 -m pip install open3d" >/dev/null 2>&1
+    # open3d itself is installed (visibly) in step 2, whether or not fusion is on.
 else
     echo "    LiDAR map fusion disabled in config -> depth stream stays off"
 fi
@@ -181,26 +288,25 @@ fi
 # Clear stale ROS 2 FastDDS shared memory locks that cause "Failed init_port" errors after unclean shutdowns
 docker exec -u admin "$CONTAINER" /bin/bash -c "rm -f /dev/shm/fastrtps*" >/dev/null 2>&1
 
-# Ensure Open3D is installed for LiDAR map matching / .obj import
-echo "    ensuring Open3D is installed..."
-docker exec -u admin "$CONTAINER" pip3 install -q "open3d>=0.18" 2>/dev/null || echo "    ⚠️  open3d install failed (non-fatal)"
+echo "    checking Python packages in the container..."
+# Open3D: LiDAR map matching and .obj import. Imported lazily, so a missing
+# copy disables those features without stopping the dashboard.
+ensure_py_module open3d open3d "open3d>=0.18" \
+    || echo "    ⚠️  open3d is not available: LiDAR map matching and .obj import are disabled"
 
-# Ensure PyOpenGL is installed -- map_viewer.py's 3D viewport renders the
-# imported mesh with real OpenGL (depth-buffered) instead of QPainter, so
-# this import is required, not optional; without it dashboard_isaac.py
-# fails at import time with ModuleNotFoundError before the window even opens.
-echo "    ensuring PyOpenGL is installed..."
-docker exec -u admin "$CONTAINER" pip3 install -q PyOpenGL 2>/dev/null || echo "    ⚠️  PyOpenGL install failed (non-fatal)"
+# PyOpenGL -- map_viewer.py's 3D viewport renders the imported mesh with real
+# OpenGL (depth-buffered) instead of QPainter, so this import is required, not
+# optional; without it dashboard_isaac.py fails at import time with
+# ModuleNotFoundError before the window even opens. (--headless does not need it.)
+ensure_py_module OpenGL PyOpenGL PyOpenGL \
+    || echo "    ⚠️  PyOpenGL is not available: the dashboard window cannot open without it"
 
 # GNSS can be connected from Setup even when automatic connection is disabled.
 # Configure the same container user that runs the dashboard and headless bridge.
-echo "    ensuring GNSS serial input is available..."
 docker exec -u root "$CONTAINER" usermod -a -G dialout admin \
     || echo "    ⚠️  could not grant GNSS serial-port access"
-if ! docker exec -u admin "$CONTAINER" python3 -c 'import serial' 2>/dev/null; then
-    docker exec -u admin "$CONTAINER" python3 -m pip install --user -q pyserial \
-        || echo "    ⚠️  pyserial install failed; GNSS input will be unavailable"
-fi
+ensure_py_module serial pyserial --user pyserial \
+    || echo "    ⚠️  pyserial is not available: GNSS input will be unavailable"
 
 # ── NumPy ABI guard ───────────────────────────────────────────────────────────
 # The container image ships NumPy 2.x in /usr/local/lib/python3.10/dist-packages,
@@ -224,9 +330,10 @@ fi
 echo "    checking NumPy ABI (cv_bridge/cv2 need numpy<2)..."
 if ! docker exec -u admin "$CONTAINER" \
         python3 -c 'import numpy,sys; sys.exit(0 if numpy.__version__.split(".")[0] == "1" else 1)' 2>/dev/null; then
-    echo "    NumPy 2.x is in front -- pinning to numpy<2 (takes a few seconds)..."
-    docker exec -u admin "$CONTAINER" python3 -m pip install -q 'numpy<2' \
-        || echo "    ⚠️  numpy<2 install reported an error"
+    echo "    NumPy 2.x is in front -- pinning to numpy<2..."
+    echo "    (pip will complain that cupy-cuda12x wants numpy>=2: expected and harmless here)"
+    container_run admin python3 -m pip install 'numpy<2' \
+        || { stop_if_interrupted $?; echo "    ⚠️  numpy<2 install reported an error"; }
 fi
 if ! docker exec -u admin "$CONTAINER" /bin/bash -c \
         "source /opt/ros/humble/setup.bash && python3 -c 'import numpy, cv2, cv_bridge'" 2>/dev/null; then
@@ -257,11 +364,12 @@ vslam_present() {
         "source /opt/ros/humble/setup.bash && ros2 component types 2>/dev/null | grep -q isaac_ros_visual_slam"
 }
 if ! vslam_present; then
-    echo "    cuVSLAM component missing -- installing ros-humble-isaac-ros-visual-slam..."
-    docker exec -u root "$CONTAINER" /bin/bash -c \
+    echo "    cuVSLAM component missing -- installing ros-humble-isaac-ros-visual-slam"
+    echo "    (downloads it with its NITROS/GXF dependencies; progress below)..."
+    container_run root /bin/bash -c \
         "DEBIAN_FRONTEND=noninteractive apt-get update && \
          DEBIAN_FRONTEND=noninteractive apt-get install -y ros-humble-isaac-ros-visual-slam" \
-        2>&1 | tail -5
+        || stop_if_interrupted $?
 fi
 if ! vslam_present; then
     echo "❌ The cuVSLAM component is not in the container, so there will be no camera"

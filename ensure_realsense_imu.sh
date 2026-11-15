@@ -48,7 +48,10 @@ SOURCE=/tmp/librealsense-imu-fix-source
 BUILD=/tmp/librealsense-imu-fix-build
 COMMIT=e196cefa896e312d79c2df400c7623aa1e9c62ac
 if [[ ! -d "$SOURCE" ]]; then
-    git clone --depth 1 --branch v2.55.1 \
+    # --progress: git only reports progress to a terminal, and this script's
+    # stdin is the heredoc, so without it a slow clone shows nothing at all.
+    echo "    Fetching librealsense 2.55.1 source..."
+    git clone --progress --depth 1 --branch v2.55.1 \
         https://github.com/realsenseai/librealsense.git "$SOURCE"
 fi
 if [[ "$(git -C "$SOURCE" rev-parse HEAD)" != "$COMMIT" ]]; then
